@@ -63,6 +63,9 @@ pub enum DataKey {
     ConditionalEscrow(u64),
     SuccessionPlan,
     GlobalExpiryConfig,
+    // Migration
+    MigrationStatusKey,
+    EscrowMigrated(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,6 +195,9 @@ pub enum Error {
     EscrowNotExpired = 60,
     EscrowAlreadyExpired = 61,
     ExpiryBeforeRelease = 62,
+    MigrationNotStarted = 63,
+    MigrationAlreadyComplete = 64,
+    AlreadyMigrated = 65,
 }
 
 #[contractevent]
@@ -960,6 +966,16 @@ pub struct GlobalExpiryConfig {
     pub default_expiry_seconds: u64,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct MigrationStatus {
+    pub in_progress: bool,
+    pub migrated_count: u64,
+    pub total_count: u64,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConditionalReleaseExecuted {
@@ -1512,6 +1528,17 @@ impl EscrowContract {
         auto_refund_on_expiry: bool,
     ) -> Result<u64, Error> {
         customer.require_auth();
+
+        // Block new escrow creation during migration
+        if let Some(status) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MigrationStatus>(&DataKey::MigrationStatusKey)
+        {
+            if status.in_progress {
+                return Err(Error::ContractPaused);
+            }
+        }
 
         // Validate expiry: if set (non-zero), must be strictly after release_timestamp
         if expiry_timestamp != 0 && expiry_timestamp <= release_timestamp {
@@ -4637,6 +4664,197 @@ impl EscrowContract {
         false
     }
 
+    // ── MIGRATION ─────────────────────────────────────────────────────────────
+
+    pub fn begin_migration(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if let Some(status) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MigrationStatus>(&DataKey::MigrationStatusKey)
+        {
+            if !status.in_progress && status.completed_at.is_some() {
+                return Err(Error::MigrationAlreadyComplete);
+            }
+        }
+
+        let total_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+
+        let status = MigrationStatus {
+            in_progress: true,
+            migrated_count: 0,
+            total_count,
+            started_at: env.ledger().timestamp(),
+            completed_at: None,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationStatusKey, &status);
+        Ok(())
+    }
+
+    pub fn migrate_escrow(env: Env, admin: Address, escrow_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut status: MigrationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationStatusKey)
+            .ok_or(Error::MigrationNotStarted)?;
+
+        if !status.in_progress {
+            return Err(Error::MigrationNotStarted);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::EscrowMigrated(escrow_id))
+            .unwrap_or(false)
+        {
+            return Err(Error::AlreadyMigrated);
+        }
+
+        // Read and re-write the escrow record (applies any new-format defaults)
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(escrow_id))
+            .ok_or(Error::EscrowNotFound)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowMigrated(escrow_id), &true);
+
+        status.migrated_count += 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationStatusKey, &status);
+
+        Ok(())
+    }
+
+    pub fn migrate_escrow_batch(
+        env: Env,
+        admin: Address,
+        escrow_ids: Vec<u64>,
+    ) -> Result<u32, Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let status: MigrationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationStatusKey)
+            .ok_or(Error::MigrationNotStarted)?;
+
+        if !status.in_progress {
+            return Err(Error::MigrationNotStarted);
+        }
+
+        let mut migrated: u32 = 0;
+        for escrow_id in escrow_ids.iter() {
+            // Skip already-migrated entries silently in batch mode
+            if env
+                .storage()
+                .instance()
+                .get::<DataKey, bool>(&DataKey::EscrowMigrated(escrow_id))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            if let Some(escrow) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(escrow_id))
+            {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Escrow(escrow_id), &escrow);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::EscrowMigrated(escrow_id), &true);
+                migrated += 1;
+            }
+        }
+
+        // Update migrated_count
+        let mut updated_status: MigrationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationStatusKey)
+            .ok_or(Error::MigrationNotStarted)?;
+        updated_status.migrated_count += migrated as u64;
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationStatusKey, &updated_status);
+
+        Ok(migrated)
+    }
+
+    pub fn complete_migration(env: Env, admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut status: MigrationStatus = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationStatusKey)
+            .ok_or(Error::MigrationNotStarted)?;
+
+        if !status.in_progress {
+            return Err(Error::MigrationNotStarted);
+        }
+
+        if status.migrated_count < status.total_count {
+            return Err(Error::MigrationNotStarted);
+        }
+
+        status.in_progress = false;
+        status.completed_at = Some(env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationStatusKey, &status);
+
+        Ok(())
+    }
+
+    pub fn get_migration_status(env: Env) -> MigrationStatus {
+        env.storage()
+            .instance()
+            .get(&DataKey::MigrationStatusKey)
+            .unwrap_or(MigrationStatus {
+                in_progress: false,
+                migrated_count: 0,
+                total_count: 0,
+                started_at: 0,
+                completed_at: None,
+            })
+    }
+
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
         if let Some(state) = env
             .storage()
@@ -5941,3 +6159,6 @@ mod pause_history_test;
 
 #[cfg(test)]
 mod expiry_test;
+
+#[cfg(test)]
+mod migration_test;
