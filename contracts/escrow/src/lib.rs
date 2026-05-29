@@ -63,6 +63,9 @@ pub enum DataKey {
     ConditionalEscrow(u64),
     SuccessionPlan,
     GlobalExpiryConfig,
+    EscalationConfig,
+    EscrowEvidencePage(u64, u32),
+    EscrowEvidencePageCount(u64),
     // Migration
     MigrationStatusKey,
     EscrowMigrated(u64),
@@ -76,6 +79,21 @@ pub enum EscrowStatus {
     Disputed,
     Resolved,
     Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum AutoResolveFavor {
+    Customer,
+    Merchant,
+    SplitEqual,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscalationConfig {
+    pub timeout_seconds: u64,
+    pub favor: AutoResolveFavor,
 }
 
 #[derive(Clone)]
@@ -146,8 +164,6 @@ pub enum Error {
     InvalidVestingSchedule = 9,
     CliffPeriodNotPassed = 10,
     MilestoneAlreadyReleased = 11,
-    InsufficientVestedAmount = 12,
-    TransferFailed = 13,
     InvalidParticipantCount = 14,
     InvalidSharesSum = 15,
     DuplicateApproval = 16,
@@ -161,18 +177,11 @@ pub enum Error {
     NotAnAdmin = 24,
     AlreadyApproved = 25,
     ActionNotReady = 26,
-    ActionExpired = 27,
-    ActionAlreadyExecuted = 28,
-    ActionCancelled = 29,
     ContractPaused = 30,
     FunctionPaused = 31,
     EmptyTokenList = 35,
     DuplicateToken = 36,
     TokenTransferPartialFailure = 37,
-    Underfunded = 32,
-    NotClaimable = 33,
-    OracleStalePriceFeed = 44,
-    NoOracleCondition = 46,
     BatchTooLarge = 40,
     MilestoneNotFound = 47,
     MilestoneNotApproved = 48,
@@ -190,7 +199,6 @@ pub enum Error {
     EmptyPauseReason = 55,
     InvalidWeightSum = 56,
     InvalidThreshold = 57,
-    WeightUpdateLocked = 58,
     ParticipantNotFound = 59,
     EscrowNotExpired = 60,
     EscrowAlreadyExpired = 61,
@@ -481,8 +489,11 @@ pub struct Escrow {
     pub escalation_level: u64,
     pub min_hold_period: u64,
     pub fee_bps: i128,
-    pub expiry_timestamp: u64,       // 0 = no expiry
+    pub expiry_timestamp: u64,
     pub auto_refund_on_expiry: bool,
+    pub escalated_at: Option<u64>,
+    pub escalation_timeout: u64,
+    pub auto_resolve_in_favor_of: AutoResolveFavor,
 }
 
 #[derive(Clone)]
@@ -601,6 +612,7 @@ pub enum ActionType {
     AddAdmin,
     RemoveAdmin,
     UpdateRequiredSignatures,
+    UpdateThreshold { new_threshold: u32 },
 }
 
 #[derive(Clone)]
@@ -958,6 +970,14 @@ pub struct EscrowExpired {
     pub escrow_id: u64,
     pub refunded_to: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeoutResolutionTriggered {
+    pub escrow_id: u64,
+    pub favor: AutoResolveFavor,
+    pub resolved_at: u64,
 }
 
 #[derive(Clone)]
@@ -1368,30 +1388,12 @@ impl EscrowContract {
     pub fn update_required_signatures(
         env: Env,
         caller: Address,
-        required: u32,
+        _required: u32,
     ) -> Result<(), Error> {
         caller.require_auth();
-
-        let mut config: MultiSigConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultiSigConfig)
-            .ok_or(Error::MultiSigNotInitialized)?;
-
-        if !config.admins.contains(&caller) {
-            return Err(Error::NotAnAdmin);
-        }
-
-        if required == 0 || required > config.total_admins {
-            return Err(Error::InsufficientAdmins);
-        }
-
-        config.required_signatures = required;
-        env.storage()
-            .instance()
-            .set(&DataKey::MultiSigConfig, &config);
-
-        Ok(())
+        // Direct calls are forbidden — must use propose_action / execute_action
+        // with ActionType::UpdateThreshold so the change requires multi-sig approval.
+        Err(Error::Unauthorized)
     }
 
     pub fn designate_successor(
@@ -1561,6 +1563,15 @@ impl EscrowContract {
             0
         };
 
+        let escalation_cfg: EscalationConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscalationConfig)
+            .unwrap_or(EscalationConfig {
+                timeout_seconds: 604800,
+                favor: AutoResolveFavor::Customer,
+            });
+
         let escrow = Escrow {
             id: escrow_id,
             customer: customer.clone(),
@@ -1577,6 +1588,9 @@ impl EscrowContract {
             fee_bps,
             expiry_timestamp,
             auto_refund_on_expiry,
+            escalated_at: None,
+            escalation_timeout: escalation_cfg.timeout_seconds,
+            auto_resolve_in_favor_of: escalation_cfg.favor,
         };
 
         env.storage()
@@ -1910,7 +1924,7 @@ impl EscrowContract {
         // Block weight updates once any participant has already approved.
         for p in escrow.participants.iter() {
             if p.approved {
-                return Err(Error::WeightUpdateLocked);
+                return Err(Error::InvalidStatus);
             }
         }
 
@@ -2658,6 +2672,65 @@ impl EscrowContract {
         items
     }
 
+    pub fn submit_evidence_batch(
+        env: Env,
+        caller: Address,
+        escrow_id: u64,
+        evidence_items: Vec<Bytes>,
+    ) -> Result<u32, Error> {
+        caller.require_auth();
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, escrow_id);
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+        if escrow.customer != caller && escrow.merchant != caller {
+            return Err(Error::Unauthorized);
+        }
+
+        const MAX_BATCH: u32 = 10;
+        if evidence_items.len() > MAX_BATCH {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let now = env.ledger().timestamp();
+        let page_num: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowEvidencePageCount(escrow_id))
+            .unwrap_or(0);
+
+        let mut page: Vec<Evidence> = Vec::new(&env);
+        for item in evidence_items.iter() {
+            let ipfs_hash = EscrowContract::evidence_bytes_to_label_string(&env, item);
+            page.push_back(Evidence {
+                submitter: caller.clone(),
+                ipfs_hash,
+                submitted_at: now,
+            });
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowEvidencePage(escrow_id, page_num), &page);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowEvidencePageCount(escrow_id), &(page_num + 1));
+
+        Ok(page_num + 1)
+    }
+
+    pub fn get_evidence_page(env: Env, escrow_id: u64, page: u32) -> Vec<Evidence> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowEvidencePage(escrow_id, page))
+            .unwrap_or(Vec::new(&env))
+    }
+
     pub fn escalate_dispute(env: Env, caller: Address, escrow_id: u64) -> Result<(), Error> {
         caller.require_auth();
         if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
@@ -2671,7 +2744,9 @@ impl EscrowContract {
             return Err(Error::Unauthorized);
         }
         escrow.escalation_level = escrow.escalation_level.saturating_add(1);
-        escrow.last_activity_at = env.ledger().timestamp();
+        let now = env.ledger().timestamp();
+        escrow.escalated_at = Some(now);
+        escrow.last_activity_at = now;
         env.storage()
             .instance()
             .set(&DataKey::Escrow(escrow_id), &escrow);
@@ -2722,6 +2797,116 @@ impl EscrowContract {
             amount: escrow.amount,
         }
         .publish(&env);
+        Ok(())
+    }
+
+    pub fn set_escalation_config(
+        env: Env,
+        admin: Address,
+        timeout_seconds: u64,
+        favor: AutoResolveFavor,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        let cfg = EscalationConfig { timeout_seconds, favor };
+        env.storage().instance().set(&DataKey::EscalationConfig, &cfg);
+        Ok(())
+    }
+
+    pub fn check_escalation_timeout(env: Env, escrow_id: u64) -> bool {
+        let escrow: Option<Escrow> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(escrow_id));
+        let escrow = match escrow {
+            Some(e) => e,
+            None => return false,
+        };
+        if let Some(escalated_at) = escrow.escalated_at {
+            let now = env.ledger().timestamp();
+            now.saturating_sub(escalated_at) >= escrow.escalation_timeout
+        } else {
+            false
+        }
+    }
+
+    pub fn trigger_timeout_resolution(env: Env, escrow_id: u64) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        if escrow.status != EscrowStatus::Disputed {
+            return Err(Error::NotDisputed);
+        }
+
+        let escalated_at = escrow.escalated_at.ok_or(Error::InvalidStatus)?;
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(escalated_at) < escrow.escalation_timeout {
+            return Err(Error::TimeoutNotReached);
+        }
+
+        let favor = escrow.auto_resolve_in_favor_of.clone();
+
+        match &favor {
+            AutoResolveFavor::Customer => {
+                escrow.status = EscrowStatus::Resolved;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Escrow(escrow_id), &escrow);
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &escrow.customer,
+                    escrow.amount,
+                )?;
+            }
+            AutoResolveFavor::Merchant => {
+                escrow.status = EscrowStatus::Released;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Escrow(escrow_id), &escrow);
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &escrow.merchant,
+                    escrow.amount,
+                )?;
+            }
+            AutoResolveFavor::SplitEqual => {
+                let half = escrow.amount / 2;
+                let remainder = escrow.amount - half;
+                escrow.status = EscrowStatus::Resolved;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Escrow(escrow_id), &escrow);
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &escrow.customer,
+                    half,
+                )?;
+                EscrowContract::transfer_if_token_contract(
+                    &env,
+                    &escrow.token,
+                    &escrow.merchant,
+                    remainder,
+                )?;
+            }
+        }
+
+        (TimeoutResolutionTriggered {
+            escrow_id,
+            favor,
+            resolved_at: now,
+        })
+        .publish(&env);
+
         Ok(())
     }
 
@@ -3524,7 +3709,7 @@ impl EscrowContract {
         let releasable_amount = vested_amount.saturating_sub(vesting_schedule.released_amount);
 
         if releasable_amount == 0 {
-            return Err(Error::InsufficientVestedAmount);
+            return Err(Error::InvalidStatus);
         }
 
         // Update the released amount
@@ -3807,7 +3992,7 @@ impl EscrowContract {
             .try_transfer(&contract_address, recipient, &amount)
             .is_err()
         {
-            return Err(Error::TransferFailed);
+            return Err(Error::TokenTransferPartialFailure);
         }
         Ok(())
     }
@@ -4091,6 +4276,23 @@ impl EscrowContract {
                     .instance()
                     .set(&DataKey::MultiSigConfig, &config);
             }
+            ActionType::UpdateThreshold { new_threshold } => {
+                let mut config: MultiSigConfig = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::MultiSigConfig)
+                    .ok_or(Error::MultiSigNotInitialized)?;
+                if new_threshold == 0 {
+                    return Err(Error::InvalidThreshold);
+                }
+                if new_threshold > config.total_admins {
+                    return Err(Error::InsufficientAdmins);
+                }
+                config.required_signatures = new_threshold;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::MultiSigConfig, &config);
+            }
             _ => {}
         }
         Ok(())
@@ -4161,7 +4363,7 @@ impl EscrowContract {
             return Err(Error::ActionAlreadyExecuted);
         }
         if action.cancelled {
-            return Err(Error::ActionCancelled);
+            return Err(Error::AlreadyProcessed);
         }
 
         let current_time = env.ledger().timestamp();
@@ -4169,7 +4371,7 @@ impl EscrowContract {
             return Err(Error::ActionNotReady);
         }
         if current_time > action.expires_at {
-            return Err(Error::ActionExpired);
+            return Err(Error::ProposalExpired);
         }
 
         action.executed = true;
@@ -4222,10 +4424,10 @@ impl EscrowContract {
             .ok_or(Error::ProposalNotFound)?;
 
         if action.executed {
-            return Err(Error::ActionAlreadyExecuted);
+            return Err(Error::ProposalAlreadyExecuted);
         }
         if action.cancelled {
-            return Err(Error::ActionCancelled);
+            return Err(Error::AlreadyProcessed);
         }
 
         // Only the proposing admin or any other admin can cancel
@@ -4976,7 +5178,7 @@ impl EscrowContract {
 
         let escrow = Self::get_escrow(&env, escrow_id);
         if escrow.status != EscrowStatus::Resolved && escrow.status != EscrowStatus::Cancelled {
-            return Err(Error::NotClaimable);
+            return Err(Error::InvalidStatus);
         }
 
         let config: InsuranceConfig = env
@@ -5032,7 +5234,7 @@ impl EscrowContract {
 
         let mut pool = Self::get_insurance_pool(env.clone());
         if pool.balance < claim.amount {
-            return Err(Error::Underfunded);
+            return Err(Error::InvalidStatus);
         }
 
         Self::transfer_if_token_contract(&env, &pool.token, &claim.claimant, claim.amount)?;
@@ -5274,7 +5476,7 @@ impl EscrowContract {
         env.storage()
             .instance()
             .get(&DataKey::OracleCondition(escrow_id))
-            .ok_or(Error::NoOracleCondition)
+            .ok_or(Error::InvalidStatus)
     }
 
     pub fn auto_resolve_with_oracle(env: Env, escrow_id: u64) -> Result<(), Error> {
@@ -5289,7 +5491,7 @@ impl EscrowContract {
             .storage()
             .instance()
             .get(&DataKey::OracleCondition(escrow_id))
-            .ok_or(Error::NoOracleCondition)?;
+            .ok_or(Error::InvalidStatus)?;
 
         let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
         args.push_back(condition.oracle.price_feed_id.clone().into());
@@ -5301,7 +5503,7 @@ impl EscrowContract {
 
         let now = env.ledger().timestamp();
         if now.saturating_sub(price_data.timestamp) > condition.oracle.staleness_threshold {
-            return Err(Error::OracleStalePriceFeed);
+            return Err(Error::InvalidStatus);
         }
 
         let condition_met = match condition.comparison {
@@ -6161,4 +6363,11 @@ mod pause_history_test;
 mod expiry_test;
 
 #[cfg(test)]
+mod multisig_threshold_test;
+
+#[cfg(test)]
+mod escalation_timeout_test;
+
+#[cfg(test)]
+mod bulk_evidence_test;
 mod migration_test;

@@ -44,6 +44,8 @@ pub enum DataKey {
     // Payment Channel support (#125)
     PaymentChannel(u64),
     PaymentChannelCounter,
+    MeteredSubscription(u64),
+    MeteredSubscriptionCounter,
 }
 
 // Customer-specific data keys
@@ -257,6 +259,8 @@ pub enum Error {
     ChannelClosed = 76,
     ChannelExpired = 77,
     ChannelNotExpired = 78,
+    MeteredSubscriptionNotFound = 79,
+    BillingCapExceeded = 80,
 }
 
 #[contractevent]
@@ -412,6 +416,20 @@ pub struct PaymentChannel {
     pub expires_at: u64,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct MeteredSubscription {
+    pub subscription_id: u64,
+    pub merchant: Address,
+    pub customer: Address,
+    pub token: Address,
+    pub price_per_unit: i128,
+    pub unit_name: String,
+    pub accumulated_units: u64,
+    pub billing_cap: Option<i128>,
+    pub last_reset_at: u64,
+}
+
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChannelOpened {
@@ -434,6 +452,29 @@ pub struct ChannelSettled {
 pub struct ChannelExpiredClosed {
     pub channel_id: u64,
     pub refunded_to: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageReported {
+    pub subscription_id: u64,
+    pub units: u64,
+    pub accumulated: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MeteredBillingExecuted {
+    pub subscription_id: u64,
+    pub amount: i128,
+    pub units_billed: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BillingCapReached {
+    pub subscription_id: u64,
+    pub cap: i128,
 }
 
 #[contractevent]
@@ -3365,6 +3406,175 @@ impl PaymentContract {
         }
 
         Ok(())
+    }
+
+    pub fn create_metered_subscription(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        price_per_unit: i128,
+        unit_name: String,
+        token: Address,
+        billing_cap: Option<i128>,
+    ) -> Result<u64, Error> {
+        merchant.require_auth();
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MeteredSubscriptionCounter)
+            .unwrap_or(0);
+        let sub_id = counter + 1;
+
+        let now = env.ledger().timestamp();
+
+        let sub = MeteredSubscription {
+            subscription_id: sub_id,
+            merchant,
+            customer,
+            token,
+            price_per_unit,
+            unit_name,
+            accumulated_units: 0,
+            billing_cap,
+            last_reset_at: now,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MeteredSubscription(sub_id), &sub);
+        env.storage()
+            .instance()
+            .set(&DataKey::MeteredSubscriptionCounter, &sub_id);
+
+        Ok(sub_id)
+    }
+
+    pub fn report_usage(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        units: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let mut sub: MeteredSubscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::MeteredSubscription(subscription_id))
+            .ok_or(Error::MeteredSubscriptionNotFound)?;
+
+        if sub.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        sub.accumulated_units = sub.accumulated_units.saturating_add(units);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MeteredSubscription(subscription_id), &sub);
+
+        (UsageReported {
+            subscription_id,
+            units,
+            accumulated: sub.accumulated_units,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_current_usage(env: Env, subscription_id: u64) -> MeteredSubscription {
+        env.storage()
+            .instance()
+            .get(&DataKey::MeteredSubscription(subscription_id))
+            .expect("MeteredSubscription not found")
+    }
+
+    pub fn set_billing_cap(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        cap: i128,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let mut sub: MeteredSubscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::MeteredSubscription(subscription_id))
+            .ok_or(Error::MeteredSubscriptionNotFound)?;
+
+        if sub.merchant != merchant {
+            return Err(Error::Unauthorized);
+        }
+
+        sub.billing_cap = Some(cap);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MeteredSubscription(subscription_id), &sub);
+
+        Ok(())
+    }
+
+    pub fn execute_metered_billing(
+        env: Env,
+        subscription_id: u64,
+    ) -> Result<i128, Error> {
+        let mut sub: MeteredSubscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::MeteredSubscription(subscription_id))
+            .ok_or(Error::MeteredSubscriptionNotFound)?;
+
+        let units_billed = sub.accumulated_units;
+        if units_billed == 0 {
+            return Ok(0);
+        }
+
+        let mut amount = (units_billed as i128).saturating_mul(sub.price_per_unit);
+        let mut cap_hit = false;
+
+        if let Some(cap) = sub.billing_cap {
+            if amount > cap {
+                amount = cap;
+                cap_hit = true;
+            }
+        }
+
+        let token_client = token::Client::new(&env, &sub.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(
+            &contract_address,
+            &sub.customer,
+            &sub.merchant,
+            &amount,
+        );
+
+        sub.accumulated_units = 0;
+        sub.last_reset_at = env.ledger().timestamp();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MeteredSubscription(subscription_id), &sub);
+
+        if cap_hit {
+            (BillingCapReached {
+                subscription_id,
+                cap: sub.billing_cap.unwrap_or(0),
+            })
+            .publish(&env);
+        }
+
+        (MeteredBillingExecuted {
+            subscription_id,
+            amount,
+            units_billed,
+        })
+        .publish(&env);
+
+        Ok(amount)
     }
 
     /// Cancel a subscription. Only the customer, merchant, or admin may call this.
@@ -6779,3 +6989,6 @@ mod test_payment_channel;
 
 #[cfg(test)]
 mod test_cross_contract_escrow_verification;
+
+#[cfg(test)]
+mod test_metered_billing;
