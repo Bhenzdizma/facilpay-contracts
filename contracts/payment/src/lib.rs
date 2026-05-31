@@ -94,6 +94,10 @@ pub enum StateDataKey {
     AdminProposal(String),
     LargePaymentProposal(u64),
     PauseHistoryEntry(u64),
+    PauseHistoryCount,
+    // Auto-escrow
+    AutoEscrowRule(Address),
+    AutoEscrowTriggered(u64),
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
 }
 
@@ -233,6 +237,9 @@ pub enum Error {
     ContractPaused = 43,
     FunctionPaused = 44,
     InvalidTierThresholds = 45,
+    AutoEscrowRuleNotFound = 46,
+    AutoEscrowBelowMinimum = 47,
+    AutoEscrowAlreadyTriggered = 48,
     PaymentNotYetDue = 54,
     ScheduledPaymentCancelled = 55,
     OracleFeedStale = 58,
@@ -679,6 +686,12 @@ pub struct ConditionalPayment {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct AutoEscrowRule {
+    pub merchant: Address,
+    pub escrow_bps: u32,
+    pub min_amount: i128,
+    pub token: Address,
+    pub active: bool,
 pub struct ScheduledPayment {
     pub payment_id: u64,
     pub customer: Address,
@@ -967,6 +980,12 @@ pub struct FunctionUnpausedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoEscrowTriggered {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub escrow_id: u64,
+    pub amount: i128,
+    pub escrow_amount: i128,
 pub struct LargePaymentProposed {
     pub payment_id: u64,
     pub proposer: Address,
@@ -2415,6 +2434,10 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Attempt to trigger auto-escrow if a rule exists
+        // Ignore errors - if there's no rule, payment is below minimum, or already triggered,
+        // we just skip the auto-escrow (the payment completion still succeeds)
+        let _ = PaymentContract::trigger_auto_escrow(env, payment_id);
         let now = env.ledger().timestamp();
         PaymentContract::update_merchant_bucket(env, payment.merchant.clone(), now, 0, 0, 0, 0);
         PaymentContract::update_platform_daily_bucket(env, now, 0, 0, 0);
@@ -6307,6 +6330,152 @@ impl PaymentContract {
             }
         }
         false
+    }
+
+    pub fn set_auto_escrow_rule(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        escrow_bps: u32,
+        min_amount: i128,
+        token: Address,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_auto_escrow_rule")?;
+        admin.require_auth();
+
+        // Verify caller is admin
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let rule = AutoEscrowRule {
+            merchant: merchant.clone(),
+            escrow_bps,
+            min_amount,
+            token,
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoEscrowRule(merchant), &rule);
+
+        Ok(())
+    }
+
+    pub fn get_auto_escrow_rule(env: Env, merchant: Address) -> Option<AutoEscrowRule> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoEscrowRule(merchant))
+    }
+
+    pub fn remove_auto_escrow_rule(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env, "remove_auto_escrow_rule")?;
+        admin.require_auth();
+
+        // Verify caller is admin
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if rule exists
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AutoEscrowRule(merchant.clone()))
+        {
+            return Err(Error::AutoEscrowRuleNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::AutoEscrowRule(merchant));
+
+        Ok(())
+    }
+
+    pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(env, payment_id);
+
+        // Check if auto-escrow already triggered for this payment
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::AutoEscrowTriggered(payment_id))
+        {
+            return Err(Error::AutoEscrowAlreadyTriggered);
+        }
+
+        // Get auto-escrow rule for merchant
+        let rule = env
+            .storage()
+            .instance()
+            .get::<DataKey, AutoEscrowRule>(&DataKey::AutoEscrowRule(payment.merchant.clone()))
+            .ok_or(Error::AutoEscrowRuleNotFound)?;
+
+        // Rule must be active
+        if !rule.active {
+            return Err(Error::AutoEscrowRuleNotFound);
+        }
+
+        // Check if payment amount meets minimum
+        if payment.amount < rule.min_amount {
+            // Silently skip if below minimum (no error)
+            return Ok(());
+        }
+
+        // Check token matches the rule
+        if payment.token != rule.token {
+            return Err(Error::PaymentNotFound);
+        }
+
+        // Calculate escrow amount based on bps (basis points)
+        // escrow_bps is in basis points, so divide by 10000
+        let escrow_amount = (payment.amount * (rule.escrow_bps as i128)) / 10000i128;
+
+        // Create escrow using the escrow contract
+        let escrow_client = EscrowContractClient::new(&env, &env.current_contract_address());
+        let release_timestamp = env.ledger().timestamp() + 86400 * 30; // 30 days
+        let escrow_id = escrow_client.create_escrow(
+            &payment.customer,
+            &payment.merchant,
+            &escrow_amount,
+            &payment.token,
+            &release_timestamp,
+            &0, // min_hold_period
+        );
+
+        // Mark escrow as triggered for this payment
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoEscrowTriggered(payment_id), &escrow_id);
+
+        // Emit event
+        (AutoEscrowTriggered {
+            payment_id,
+            merchant: payment.merchant,
+            escrow_id,
+            amount: payment.amount,
+            escrow_amount,
+        })
+        .publish(&env);
+
+        Ok(())
     }
 
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
