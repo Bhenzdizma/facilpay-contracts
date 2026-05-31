@@ -23,6 +23,7 @@ pub enum DataKey {
     RefundStatusCount(RefundStatus),
     RefundStatusIndex(u64),
     MerchantRefunds(Address, u64),
+    MerchantRefundQuota(Address),
     MerchantRefundCount(Address),
     CustomerRefunds(Address, u64),
     CustomerRefundCount(Address),
@@ -163,6 +164,8 @@ pub enum Error {
     HookNotFound = 41,
     MaxHooksPerEventReached = 42,
     HookNotOwnedBySubscriber = 43,
+    MerchantQuotaExceeded = 44,
+    QuotaNotConfigured = 45,
 }
 
 #[contractevent]
@@ -427,6 +430,16 @@ pub struct MerchantRefundSummary {
     pub total_amount_refunded: i128,
     pub pending_count: u64,
     pub pending_amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct MerchantRefundQuota {
+    pub merchant: Address,
+    pub limit: i128,
+    pub period_seconds: u64,
+    pub used: i128,
+    pub period_start: u64,
 }
 
 // Issue #147: Customer refund summary
@@ -1197,6 +1210,66 @@ impl RefundContract {
             .instance()
             .get(&PolicyKey::AutoRefundTrigger(trigger_id))
             .ok_or(Error::AutoRefundTriggerNotFound)
+    }
+
+    pub fn set_merchant_refund_quota(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        limit: i128,
+        period_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let quota = MerchantRefundQuota {
+            merchant: merchant.clone(),
+            limit,
+            period_seconds,
+            used: 0,
+            period_start: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefundQuota(merchant), &quota);
+        Ok(())
+    }
+
+    pub fn get_merchant_refund_quota(env: Env, merchant: Address) -> Option<MerchantRefundQuota> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MerchantRefundQuota(merchant))
+    }
+
+    pub fn reset_merchant_quota(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut quota: MerchantRefundQuota = env
+            .storage()
+            .instance()
+            .get(&DataKey::MerchantRefundQuota(merchant.clone()))
+            .ok_or(Error::QuotaNotConfigured)?;
+        quota.used = 0;
+        quota.period_start = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::MerchantRefundQuota(merchant), &quota);
+        Ok(())
     }
 
     pub fn set_customer_rate_limit(
@@ -3254,6 +3327,31 @@ impl RefundContract {
             refund.amount,
             refund.original_payment_amount,
         )?;
+
+        // Enforce merchant refund quota if configured
+        if let Some(mut quota) = env
+            .storage()
+            .instance()
+            .get::<_, MerchantRefundQuota>(&DataKey::MerchantRefundQuota(refund.merchant.clone()))
+        {
+            let now = env.ledger().timestamp();
+            // auto-reset if period elapsed
+            if now > quota.period_start.saturating_add(quota.period_seconds) {
+                quota.used = 0;
+                quota.period_start = now;
+            }
+            let new_used = quota
+                .used
+                .checked_add(refund.amount)
+                .ok_or(Error::InvalidAmount)?;
+            if new_used > quota.limit {
+                return Err(Error::MerchantQuotaExceeded);
+            }
+            quota.used = new_used;
+            env.storage()
+                .instance()
+                .set(&DataKey::MerchantRefundQuota(refund.merchant.clone()), &quota);
+        }
 
         Self::remove_from_status_index(env, RefundStatus::Approved, refund_id)?;
         refund.status = RefundStatus::Processed;
