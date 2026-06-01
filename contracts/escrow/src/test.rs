@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env, String};
+use soroban_sdk::{testutils::Address as _, vec, Address, Bytes, BytesN, Env, String};
 
 // ── REPUTATION SYSTEM TESTS ──────────────────────────────────────────────────
 
@@ -909,6 +909,162 @@ fn test_multiple_escrows() {
     assert_eq!(escrow2.amount, 2000_i128);
 }
 
+fn merkle_leaf_keccak<const N: usize>(env: &Env, payload: &[u8; N]) -> BytesN<32> {
+    let b = Bytes::from_array(env, payload);
+    env.crypto().keccak256(&b).into()
+}
+
+fn merkle_root_two_leaves(env: &Env, left: BytesN<32>, right: BytesN<32>) -> BytesN<32> {
+    let la = left.to_array();
+    let ra = right.to_array();
+    let mut raw = [0u8; 64];
+    raw[..32].copy_from_slice(&la);
+    raw[32..].copy_from_slice(&ra);
+    let bytes = Bytes::from_array(env, &raw);
+    env.crypto().keccak256(&bytes).into()
+}
+
+#[test]
+fn test_commit_root_recommit_guard() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[7_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let result = client.try_commit_evidence_root(&merchant, &escrow_id, &root);
+    assert_eq!(result, Err(Ok(Error::RootAlreadyCommitted)));
+}
+
+#[test]
+fn test_get_evidence_commitment_returns_committed_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let root = BytesN::from_array(&env, &[8_u8; 32]);
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let commitment = client.try_get_evidence_commitment(&escrow_id).unwrap().unwrap();
+    assert_eq!(commitment.escrow_id, escrow_id);
+    assert_eq!(commitment.merkle_root, root);
+    assert_eq!(commitment.committed_at, 1000);
+    assert_eq!(commitment.committed_by, customer);
+}
+
+#[test]
+fn test_submit_evidence_with_valid_merkle_proof() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0.clone(), leaf1.clone());
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut proof = Vec::new(&env);
+    proof.push_back(leaf1);
+    client.submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &proof,
+        &0_u32,
+    );
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn test_submit_evidence_with_invalid_merkle_proof_rejected() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence0 = b"ipfs://valid-proof-evidence";
+    let evidence1 = b"ipfs://other-leaf";
+    let leaf0 = merkle_leaf_keccak(&env, evidence0);
+    let leaf1 = merkle_leaf_keccak(&env, evidence1);
+    let root = merkle_root_two_leaves(&env, leaf0, leaf1);
+
+    client.commit_evidence_root(&customer, &escrow_id, &root);
+
+    let mut bad_proof = Vec::new(&env);
+    bad_proof.push_back(BytesN::from_array(&env, &[9_u8; 32]));
+    let result = client.try_submit_evidence_with_proof(
+        &customer,
+        &escrow_id,
+        &Bytes::from_array(&env, evidence0),
+        &bad_proof,
+        &0_u32,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
+
+    // Invalid proof should not store evidence
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn test_submit_evidence_with_proof_falls_back_without_root() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1500_u64, &0_u64);
+    env.ledger().set_timestamp(1000);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let evidence = Bytes::from_array(&env, b"ipfs://fallback-path");
+    let empty_proof = Vec::new(&env);
+    client.submit_evidence_with_proof(&customer, &escrow_id, &evidence, &empty_proof, &0_u32);
+
+    let count = client.get_evidence_count(&escrow_id);
+    assert_eq!(count, 1);
+}
+
 #[test]
 fn test_submit_evidence_by_both_parties() {
     let env = Env::default();
@@ -1332,6 +1488,100 @@ fn test_create_vesting_escrow_invalid_milestone_sum() {
     );
 }
 
+#[test]
+fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Cliff at 2000; first milestone unlocks at 1500 — invalid schedule
+    let milestones = vec![
+        &env,
+        VestingMilestone {
+            milestone_id: 1,
+            unlock_timestamp: 1500,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Too early"),
+            approved_by: None,
+            approved_at: None,
+        },
+        VestingMilestone {
+            milestone_id: 2,
+            unlock_timestamp: 3000,
+            amount: 5000,
+            released: false,
+            description: String::from_str(&env, "Ok"),
+            approved_by: None,
+            approved_at: None,
+        },
+    ];
+
+    let result = client.try_create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &2000_u64,
+        &4000_u64,
+        &milestones,
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidVestingSchedule)));
+}
+
+#[test]
+fn test_get_cliff_status_seconds_remaining_and_passed_flag() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let milestones = Vec::new(&env);
+    let cliff_ts = 5000_u64;
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &cliff_ts,
+        &10_000_u64,
+        &milestones,
+    );
+
+    env.ledger().set_timestamp(2000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert_eq!(s.cliff_timestamp, cliff_ts);
+    assert!(!s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 3000);
+
+    env.ledger().set_timestamp(5000);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+
+    // Mid vesting window: linear schedule has releasable amount > 0
+    env.ledger().set_timestamp(7500);
+    let s = client.get_cliff_status(&escrow_id);
+    assert!(s.cliff_passed);
+    assert_eq!(s.seconds_remaining, 0);
+    let released = client.release_vested_amount(&admin, &escrow_id);
+    assert!(released > 0);
+}
+
 // ── MULTI-PARTY ESCROW TESTS ────────────────────────────────────────────────
 
 #[test]
@@ -1359,21 +1609,27 @@ fn test_create_multi_party_escrow_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 3000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 3000,
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p3.clone(),
-        share_bps: 2000,
         role: ParticipantRole::Arbitrator,
-        required_approval: false,
+        share_bps: 2000,
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
     });
 
     let release_timestamp = 1000_u64;
@@ -1388,7 +1644,7 @@ fn test_create_multi_party_escrow_success() {
     let escrow = client.get_multi_party_escrow(&escrow_id);
     assert_eq!(escrow.id, 1);
     assert_eq!(escrow.total_amount, amount);
-    assert_eq!(escrow.required_approvals, 2);
+    assert_eq!(escrow.threshold_bps, 10000);
     assert_eq!(escrow.status, EscrowStatus::Locked);
 
     // Verify tokens were transferred to contract
@@ -1730,8 +1986,7 @@ fn test_release_vested_amount_milestone() {
 }
 
 #[test]
-#[should_panic]
-fn test_release_vested_amount_before_cliff() {
+fn test_release_vested_amount_before_cliff_returns_cliff_error() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);
     let contract_id = env.register(EscrowContract, ());
@@ -1755,9 +2010,9 @@ fn test_release_vested_amount_before_cliff() {
         &milestones,
     );
 
-    // Try to release before cliff
     env.ledger().set_timestamp(1500);
-    client.release_vested_amount(&admin, &escrow_id);
+    let result = client.try_release_vested_amount(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::CliffPeriodNotPassed)));
 }
 
 #[test]
@@ -1773,15 +2028,19 @@ fn test_create_multi_party_escrow_invalid_shares() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: Address::generate(&env),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: Address::generate(&env),
-        share_bps: 4000, // Sum is 9000, should fail
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 4000, // Sum is 9000, should fail
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
     });
 
     client.create_multi_party_escrow(&customer, &participants, &1000, &token_id, &1000);
@@ -1808,15 +2067,19 @@ fn test_approve_release_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 5000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
 
     let escrow_id =
@@ -1856,21 +2119,27 @@ fn test_release_multi_party_escrow_success() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000, // 5000
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000, // 5000
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 3000, // 3000
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 3000, // 3000
+        weight_bps: 3000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p3.clone(),
-        share_bps: 2000, // 2000
         role: ParticipantRole::Arbitrator,
-        required_approval: false,
+        share_bps: 2000, // 2000
+        weight_bps: 2000,
+        approved: false,
+        approved_at: None,
     });
 
     env.ledger().set_timestamp(500);
@@ -2106,15 +2375,19 @@ fn test_release_multi_party_escrow_threshold_not_met() {
     let mut participants = Vec::new(&env);
     participants.push_back(Participant {
         address: p1.clone(),
-        share_bps: 5000,
         role: ParticipantRole::Merchant,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
     participants.push_back(Participant {
         address: p2.clone(),
-        share_bps: 5000,
         role: ParticipantRole::ServiceProvider,
-        required_approval: true,
+        share_bps: 5000,
+        weight_bps: 5000,
+        approved: false,
+        approved_at: None,
     });
 
     let escrow_id =
@@ -2125,6 +2398,232 @@ fn test_release_multi_party_escrow_threshold_not_met() {
 
     env.ledger().set_timestamp(1001);
     client.release_multi_party_escrow(&escrow_id);
+}
+
+// ── WEIGHTED VOTING TESTS ───────────────────────────────────────────────────
+
+fn make_weighted_escrow(
+    env: &Env,
+    client: &EscrowContractClient,
+    customer: &Address,
+    p_merchant: &Address,
+    p_investor: &Address,
+    token: &Address,
+) -> u64 {
+    // 60% merchant / 40% investor — both share and voting weight
+    let mut participants = Vec::new(env);
+    participants.push_back(Participant {
+        address: p_merchant.clone(),
+        role: ParticipantRole::Merchant,
+        share_bps: 6000,
+        weight_bps: 6000,
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: p_investor.clone(),
+        role: ParticipantRole::Custom(String::from_str(env, "investor")),
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+    client.create_multi_party_escrow(customer, &participants, &10000_i128, token, &1000_u64)
+}
+
+#[test]
+fn test_weighted_threshold_met_releases() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let token_user_client = token::Client::new(&env, &token_id);
+    token::StellarAssetClient::new(&env, &token_id).mint(&Address::generate(&env), &0); // touch
+
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Lower threshold to 60% — merchant alone can authorize release.
+    client.update_approval_threshold_bps(&admin, &escrow_id, &6000);
+
+    client.approve_release(&merchant, &escrow_id);
+
+    let (current, required) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 6000);
+    assert_eq!(required, 6000);
+
+    env.ledger().set_timestamp(1001);
+    client.release_multi_party_escrow(&escrow_id);
+
+    let escrow = client.get_multi_party_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+    assert_eq!(token_user_client.balance(&merchant), 6000);
+    assert_eq!(token_user_client.balance(&investor), 4000);
+}
+
+#[test]
+fn test_weighted_threshold_unmet_holds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Default threshold is 10000 (full weight). Only 60% approves — release must hold.
+    client.approve_release(&merchant, &escrow_id);
+
+    let (current, required) = client.get_approval_weight(&escrow_id);
+    assert_eq!(current, 6000);
+    assert_eq!(required, 10000);
+
+    env.ledger().set_timestamp(1001);
+    let result = client.try_release_multi_party_escrow(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::ApprovalsThresholdNotMet)));
+
+    let escrow = client.get_multi_party_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+}
+
+#[test]
+fn test_create_multi_party_escrow_invalid_weight_sum() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let customer = Address::generate(&env);
+    let token_id = Address::generate(&env);
+
+    let mut participants = Vec::new(&env);
+    participants.push_back(Participant {
+        address: Address::generate(&env),
+        role: ParticipantRole::Merchant,
+        share_bps: 6000,
+        weight_bps: 5000, // weights sum to 9000 — should fail
+        approved: false,
+        approved_at: None,
+    });
+    participants.push_back(Participant {
+        address: Address::generate(&env),
+        role: ParticipantRole::ServiceProvider,
+        share_bps: 4000,
+        weight_bps: 4000,
+        approved: false,
+        approved_at: None,
+    });
+
+    let result =
+        client.try_create_multi_party_escrow(&customer, &participants, &10000, &token_id, &1000);
+    assert_eq!(result, Err(Ok(Error::InvalidWeightSum)));
+}
+
+#[test]
+fn test_set_participant_weight_blocked_after_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Admin can adjust weights pre-approval, as long as the new total is still 10000.
+    client.set_participant_weight(&admin, &escrow_id, &merchant, &7000);
+    client.set_participant_weight(&admin, &escrow_id, &investor, &3000);
+
+    // Once any participant approves, weight updates are locked.
+    client.approve_release(&merchant, &escrow_id);
+    let result = client.try_set_participant_weight(&admin, &escrow_id, &merchant, &8000);
+    assert_eq!(result, Err(Ok(Error::WeightUpdateLocked)));
+}
+
+#[test]
+fn test_set_participant_weight_must_keep_sum_10000() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    // Bumping merchant alone breaks the 10000 invariant.
+    let result = client.try_set_participant_weight(&admin, &escrow_id, &merchant, &7000);
+    assert_eq!(result, Err(Ok(Error::InvalidWeightSum)));
+}
+
+#[test]
+fn test_update_approval_threshold_invalid_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let customer = Address::generate(&env);
+    token::StellarAssetClient::new(&env, &token_id).mint(&customer, &10000);
+
+    let merchant = Address::generate(&env);
+    let investor = Address::generate(&env);
+
+    let escrow_id = make_weighted_escrow(&env, &client, &customer, &merchant, &investor, &token_id);
+
+    let too_low = client.try_update_approval_threshold_bps(&admin, &escrow_id, &0);
+    assert_eq!(too_low, Err(Ok(Error::InvalidThreshold)));
+
+    let too_high = client.try_update_approval_threshold_bps(&admin, &escrow_id, &10001);
+    assert_eq!(too_high, Err(Ok(Error::InvalidThreshold)));
 }
 
 // ── MULTI-SIG ADMIN TESTS ────────────────────────────────────────────────────
@@ -2371,7 +2870,8 @@ fn test_multisig_resolve_dispute_via_proposal() {
 
 fn setup_token(env: &Env) -> Address {
     let token_admin = Address::generate(env);
-    env.register_stellar_asset_contract_v2(token_admin).address()
+    env.register_stellar_asset_contract_v2(token_admin)
+        .address()
 }
 
 #[test]
@@ -2395,8 +2895,14 @@ fn test_create_multi_token_escrow_success() {
     token_b_admin.mint(&customer, &500);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
-    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 1000,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_b.clone(),
+        amount: 500,
+    });
 
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
 
@@ -2442,8 +2948,14 @@ fn test_create_multi_token_escrow_duplicate_token() {
     token_a_admin.mint(&customer, &2000);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 500 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 500,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 500,
+    });
 
     let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
     assert_eq!(result, Err(Ok(Error::DuplicateToken)));
@@ -2464,7 +2976,10 @@ fn test_create_multi_token_escrow_too_many_tokens() {
         let tok = setup_token(&env);
         let admin = token::StellarAssetClient::new(&env, &tok);
         admin.mint(&customer, &10);
-        tokens.push_back(TokenEntry { token: tok, amount: 10 });
+        tokens.push_back(TokenEntry {
+            token: tok,
+            amount: 10,
+        });
     }
 
     let result = client.try_create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2486,13 +3001,14 @@ fn test_insurance_system() {
     client.initialize(&admin);
 
     let config = InsuranceConfig {
-        premium_bps: 100, // 1%
+        premium_bps: 100,       // 1%
         max_coverage_bps: 5000, // 50%
         enabled: true,
     };
     client.set_insurance_config(&admin, &config);
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
     client.opt_into_insurance(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -2502,12 +3018,12 @@ fn test_insurance_system() {
     assert_eq!(pool.balance, 100);
 
     client.refund_escrow(&customer, &escrow_id);
-    
+
     let claim_id = client.file_insurance_claim(&admin, &escrow_id, &100_i128);
     assert_eq!(claim_id, 1);
 
     client.approve_claim(&admin, &claim_id);
-    
+
     let final_pool = client.get_insurance_pool();
     assert_eq!(final_pool.balance, 0);
     assert_eq!(final_pool.total_claims_paid, 100);
@@ -2540,9 +3056,18 @@ fn test_timelock_execute_after_expiry_returns_error() {
     token_c_admin.mint(&customer, &250);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 1000 });
-    tokens.push_back(TokenEntry { token: token_b.clone(), amount: 500 });
-    tokens.push_back(TokenEntry { token: token_c.clone(), amount: 250 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 1000,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_b.clone(),
+        amount: 500,
+    });
+    tokens.push_back(TokenEntry {
+        token: token_c.clone(),
+        amount: 250,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2577,7 +3102,10 @@ fn test_release_multi_token_escrow_before_timestamp() {
     token_a_admin.mint(&customer, &100);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 100,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2603,9 +3131,16 @@ fn test_release_multi_token_escrow_double_release() {
     client.initialize(&admin);
 
     // Set a short timelock (1 hour delay, 1 hour grace)
-    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 3600 });
+    client.set_timelock_config(
+        &admin,
+        &TimeLockConfig {
+            delay: 3600,
+            grace_period: 3600,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     let action_id = client.queue_action(
@@ -2637,7 +3172,10 @@ fn test_timelock_execute_after_delay_succeeds() {
     token_a_admin.mint(&customer, &100);
 
     let mut tokens = Vec::new(&env);
-    tokens.push_back(TokenEntry { token: token_a.clone(), amount: 100 });
+    tokens.push_back(TokenEntry {
+        token: token_a.clone(),
+        amount: 100,
+    });
 
     env.ledger().set_timestamp(500);
     let escrow_id = client.create_multi_token_escrow(&customer, &merchant, &tokens, &1000_u64);
@@ -2670,11 +3208,17 @@ fn test_get_multi_token_escrow_not_found() {
     env.ledger().set_timestamp(1000);
     client.initialize(&admin);
 
-
     // Set a 1-hour timelock, 24-hour grace period
-    client.set_timelock_config(&admin, &TimeLockConfig { delay: 3600, grace_period: 86400 });
+    client.set_timelock_config(
+        &admin,
+        &TimeLockConfig {
+            delay: 3600,
+            grace_period: 86400,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &9999_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     let action_id = client.queue_action(
@@ -2708,13 +3252,12 @@ fn test_single_token_escrow_still_works_after_multi_token_addition() {
 
     client.initialize(&admin);
     env.ledger().set_timestamp(500);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1000_u64, &0_u64);
     env.ledger().set_timestamp(1001);
     client.release_escrow(&admin, &escrow_id, &false);
 
-    let escrow = env.as_contract(&contract_id, || {
-        EscrowContract::get_escrow(&env, escrow_id)
-    });
+    let escrow = env.as_contract(&contract_id, || EscrowContract::get_escrow(&env, escrow_id));
     assert_eq!(escrow.status, EscrowStatus::Released);
 }
 
@@ -3354,20 +3897,24 @@ fn test_insurance_underfunded() {
     env.mock_all_auths();
     client.initialize(&admin);
 
-    client.set_insurance_config(&admin, &InsuranceConfig {
-        premium_bps: 10,
-        max_coverage_bps: 1000,
-        enabled: true,
-    });
+    client.set_insurance_config(
+        &admin,
+        &InsuranceConfig {
+            premium_bps: 10,
+            max_coverage_bps: 1000,
+            enabled: true,
+        },
+    );
 
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
     client.opt_into_insurance(&escrow_id);
 
     client.refund_escrow(&customer, &escrow_id);
-    
+
     let claim_id = client.file_insurance_claim(&admin, &escrow_id, &50_i128);
     let result = client.try_approve_claim(&admin, &claim_id);
-    
+
     assert!(result.is_err());
 }
 
@@ -3412,21 +3959,25 @@ fn test_release_milestone_success() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let token = Address::generate(&env);
-    
+
     env.mock_all_auths();
-    
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: false, // releases to merchant
-    });
+
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: false, // releases to merchant
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
 
     // After release_timestamp (1100) + inactivity (100) = 1200
     env.ledger().set_timestamp(1201);
-    
+
     assert!(client.is_watchdog_eligible(&escrow_id));
     client.trigger_watchdog_release(&escrow_id);
 
@@ -3556,18 +4107,22 @@ fn test_release_unapproved_milestone_fails() {
     // Attempt release without approval
     env.ledger().set_timestamp(2500);
     let result = client.try_release_milestone(&escrow_id, &1_u64);
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: false,
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: false,
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
     client.dispute_escrow(&customer, &escrow_id);
 
     env.ledger().set_timestamp(1201);
-    
+
     assert!(!client.is_watchdog_eligible(&escrow_id));
     let result = client.try_trigger_watchdog_release(&escrow_id);
     assert!(result.is_err());
@@ -3607,18 +4162,22 @@ fn test_watchdog_premature_trigger() {
 
     // Duplicate release attempt must fail
     let result = client.try_release_milestone(&escrow_id, &1_u64);
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 1000,
-        enabled: true,
-        favor_customer_on_release: false,
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 1000,
+            enabled: true,
+            favor_customer_on_release: false,
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &2000_u64, &0_u64);
 
     // Before inactivity window (2000 + 1000 = 3000)
     env.ledger().set_timestamp(2500);
-    
+
     assert!(!client.is_watchdog_eligible(&escrow_id));
     let result = client.try_trigger_watchdog_release(&escrow_id);
     assert!(result.is_err());
@@ -3746,6 +4305,164 @@ fn test_get_pending_milestones() {
 }
 
 #[test]
+fn test_set_vesting_acceleration_config_and_single_acceleration() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &3500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &2000_u32, &4000_u32)
+        .unwrap();
+
+    env.ledger().set_timestamp(2500);
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    assert_eq!(client.calculate_accelerated_amount(&escrow_id), 1000);
+    assert_eq!(client.get_vested_amount(&escrow_id), 6000);
+
+    let config = client.get_acceleration_config(&escrow_id).unwrap();
+    assert_eq!(config.total_accelerated_bps, 2000);
+}
+
+#[test]
+fn test_calculate_accelerated_amount_returns_expected_amount() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &1000_u32, &3000_u32)
+        .unwrap();
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    env.ledger().set_timestamp(2500);
+
+    // Base vested at 2500 = 2500/3000 of 10000 = 8333 (integer division)
+    let base_vested = client.get_vested_amount(&escrow_id) - client.calculate_accelerated_amount(&escrow_id);
+    let remaining = 10000_i128.saturating_sub(base_vested);
+    let expected = remaining.saturating_mul(1000_i128) / 10000;
+
+    assert_eq!(client.calculate_accelerated_amount(&escrow_id), expected);
+}
+
+#[test]
+fn test_mark_milestone_complete_enforces_cumulative_cap() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &3000_u32, &5000_u32)
+        .unwrap();
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    let result = client.try_mark_milestone_complete(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::AccelerationLimitExceeded)));
+}
+
+#[test]
+fn test_mark_milestone_complete_duplicate_milestone_fails() {
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+    client.initialize(&admin);
+
+    let escrow_id = client.create_vesting_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token,
+        &1500_u64,
+        &4500_u64,
+        &Vec::new(&env),
+    );
+
+    client
+        .set_vesting_acceleration_config(&admin, &escrow_id, &5000_u32, &5000_u32)
+        .unwrap();
+
+    client
+        .mark_milestone_complete(&admin, &escrow_id)
+        .unwrap();
+
+    let result = client.try_mark_milestone_complete(&admin, &escrow_id);
+    assert_eq!(result, Err(Ok(Error::MilestoneAlreadyCompleted)));
+}
+
+#[test]
 fn test_add_milestone_success() {
     let env = Env::default();
     env.ledger().set_timestamp(1000);
@@ -3760,33 +4477,32 @@ fn test_add_milestone_success() {
     env.mock_all_auths();
     client.initialize(&admin);
 
-    // Create with milestones summing to 8000 (leaving 2000 headroom)
-    let milestones = vec![
-        &env,
-        VestingMilestone {
-            milestone_id: 1,
-            unlock_timestamp: 2000,
-            amount: 8000,
-            released: false,
-            description: String::from_str(&env, "Main deliverable"),
-            approved_by: None,
-            approved_at: None,
-        },
-    ];
+    // Time-linear shell (no milestones at create); amounts are added via add_milestone
+    let milestones = Vec::new(&env);
     let escrow_id = client.create_vesting_escrow(
         &customer,
         &merchant,
         &10000_i128,
         &token,
         &1500_u64,
-        &3000_u64,
+        &5000_u64,
         &milestones,
     );
 
-    // Add a new milestone for the remaining 2000
+    let first = VestingMilestone {
+        milestone_id: 1,
+        unlock_timestamp: 2000,
+        amount: 8000,
+        released: false,
+        description: String::from_str(&env, "Main deliverable"),
+        approved_by: None,
+        approved_at: None,
+    };
+    client.add_milestone(&admin, &escrow_id, &first);
+
     let new_milestone = VestingMilestone {
         milestone_id: 0, // auto-assigned
-        unlock_timestamp: 3000,
+        unlock_timestamp: 4500,
         amount: 2000,
         released: false,
         description: String::from_str(&env, "Bonus deliverable"),
@@ -3819,17 +4535,21 @@ fn test_non_admin_cannot_approve_milestone() {
 
     let result = client.try_approve_milestone(&non_admin, &escrow_id, &1_u64);
     assert!(result.is_err());
-    client.set_watchdog_config(&admin, &WatchdogConfig {
-        inactivity_release_seconds: 100,
-        enabled: true,
-        favor_customer_on_release: true, // releases to customer
-    });
+    client.set_watchdog_config(
+        &admin,
+        &WatchdogConfig {
+            inactivity_release_seconds: 100,
+            enabled: true,
+            favor_customer_on_release: true, // releases to customer
+        },
+    );
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &1000_i128, &token, &1100_u64, &0_u64);
 
     env.ledger().set_timestamp(1201);
-    
+
     client.trigger_watchdog_release(&escrow_id);
 
     let escrow = client.get_escrow(&escrow_id);
@@ -3846,14 +4566,16 @@ fn test_escrow_fee_deduction_and_withdrawal() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    
+
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_asset_client = token::StellarAssetClient::new(&env, &token_id);
     let token_user_client = token::Client::new(&env, &token_id);
 
     client.initialize(&admin);
-    
+
     token_asset_client.mint(&contract_id, &10000);
 
     let config = EscrowFeeConfig {
@@ -3864,7 +4586,14 @@ fn test_escrow_fee_deduction_and_withdrawal() {
     client.set_escrow_fee_config(&admin, &config);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token_id, &2000_u64, &0_u64);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token_id,
+        &2000_u64,
+        &0_u64,
+    );
 
     env.ledger().set_timestamp(2500);
     client.release_escrow(&admin, &escrow_id, &false);
@@ -3876,7 +4605,7 @@ fn test_escrow_fee_deduction_and_withdrawal() {
 
     let external_wallet = Address::generate(&env);
     let withdrawn = client.withdraw_escrow_fees(&admin, &token_id, &external_wallet);
-    
+
     assert_eq!(withdrawn, 500);
     assert_eq!(client.get_accumulated_escrow_fees(&token_id), 0);
     assert_eq!(token_user_client.balance(&external_wallet), 500);
@@ -3892,21 +4621,34 @@ fn test_escrow_fee_zero_bps_path() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    
+
     let token_admin = Address::generate(&env);
-    let token_id = env.register_stellar_asset_contract_v2(token_admin).address();
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     let token_asset_client = token::StellarAssetClient::new(&env, &token_id);
     let token_user_client = token::Client::new(&env, &token_id);
 
     client.initialize(&admin);
-    
+
     token_asset_client.mint(&contract_id, &10000);
 
-    let config = EscrowFeeConfig { fee_bps: 0, fee_recipient: contract_id.clone(), enabled: false };
+    let config = EscrowFeeConfig {
+        fee_bps: 0,
+        fee_recipient: contract_id.clone(),
+        enabled: false,
+    };
     client.set_escrow_fee_config(&admin, &config);
 
     env.ledger().set_timestamp(1000);
-    let escrow_id = client.create_escrow(&customer, &merchant, &10000_i128, &token_id, &2000_u64, &0_u64);
+    let escrow_id = client.create_escrow(
+        &customer,
+        &merchant,
+        &10000_i128,
+        &token_id,
+        &2000_u64,
+        &0_u64,
+    );
 
     env.ledger().set_timestamp(2500);
     client.release_escrow(&admin, &escrow_id, &false);
@@ -3929,21 +4671,31 @@ fn test_fee_config_snapshot_isolation() {
 
     client.initialize(&admin);
 
-    let config_initial = EscrowFeeConfig { fee_bps: 0, fee_recipient: contract_id.clone(), enabled: false };
+    let config_initial = EscrowFeeConfig {
+        fee_bps: 0,
+        fee_recipient: contract_id.clone(),
+        enabled: false,
+    };
     client.set_escrow_fee_config(&admin, &config_initial);
 
-    let escrow_id_before = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id_before =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
 
-    let config_new = EscrowFeeConfig { fee_bps: 1000, fee_recipient: contract_id.clone(), enabled: true };
+    let config_new = EscrowFeeConfig {
+        fee_bps: 1000,
+        fee_recipient: contract_id.clone(),
+        enabled: true,
+    };
     client.set_escrow_fee_config(&admin, &config_new);
 
-    let escrow_id_after = client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
+    let escrow_id_after =
+        client.create_escrow(&customer, &merchant, &10000_i128, &token, &2000_u64, &0_u64);
 
-    let analytics = client.get_escrow_analytics();
-    assert_eq!(analytics.total_escrows_released, 1);
-    assert_eq!(analytics.total_value_released, 500);
-    // duration = 5000 - 1000 = 4000 seconds
-    assert_eq!(analytics.avg_escrow_duration_seconds, 4000);
+    let escrow_1 = client.get_escrow(&escrow_id_before);
+    let escrow_2 = client.get_escrow(&escrow_id_after);
+
+    assert_eq!(escrow_1.fee_bps, 0);
+    assert_eq!(escrow_2.fee_bps, 1000);
 }
 
 // ── BATCH ESCROW CREATION TESTS ─────────────────────────────────────────
@@ -4068,8 +4820,14 @@ fn test_batch_escrow_creation_partial_failure() {
     assert_eq!(results.get(1).unwrap().escrow_id, 0);
     assert_eq!(results.get(2).unwrap().escrow_id, 0);
     assert_eq!(results.get(0).unwrap().error_code, 0);
-    assert_eq!(results.get(1).unwrap().error_code, Error::InvalidStatus as u32);
-    assert_eq!(results.get(2).unwrap().error_code, Error::ReleaseNotYetAvailable as u32);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Error::InvalidStatus as u32
+    );
+    assert_eq!(
+        results.get(2).unwrap().error_code,
+        Error::ReleaseNotYetAvailable as u32
+    );
 }
 
 #[test]
@@ -4113,7 +4871,10 @@ fn test_batch_escrow_creation_too_large() {
 
     assert_eq!(results.len(), 1);
     assert!(!results.get(0).unwrap().success);
-    assert_eq!(results.get(0).unwrap().error_code, Error::BatchTooLarge as u32);
+    assert_eq!(
+        results.get(0).unwrap().error_code,
+        Error::BatchTooLarge as u32
+    );
 }
 
 #[test]
@@ -4175,9 +4936,287 @@ fn test_batch_escrow_creation_unauthorized() {
     assert!(!results.get(0).unwrap().success);
     assert_eq!(results.get(0).unwrap().error_code, Error::NotAnAdmin as u32);
 }
-    let escrow_1 = client.get_escrow(&escrow_id_before);
-    let escrow_2 = client.get_escrow(&escrow_id_after);
 
-    assert_eq!(escrow_1.fee_bps, 0);
-    assert_eq!(escrow_2.fee_bps, 1000);
+// ── DISPUTE RECOMMENDATION TESTS ────────────────────────────────────────
+
+#[test]
+fn test_dispute_recommendation_favors_merchant() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Configure rewards/penalties large enough to push merchant well above customer.
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed reputations: merchant wins a dispute → merchant=8000, customer=2000.
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &true);
+
+    // Second escrow whose recommendation we want to inspect.
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.escrow_id, escrow_id);
+    assert_eq!(rec.customer_score, 2000);
+    assert_eq!(rec.merchant_score, 8000);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorMerchant);
+    assert_eq!(rec.confidence_bps, 6000);
+}
+
+#[test]
+fn test_dispute_recommendation_favors_customer() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed reputations: customer wins → customer=8000, merchant=2000.
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&merchant, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &false);
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.customer_score, 8000);
+    assert_eq!(rec.merchant_score, 2000);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorCustomer);
+    assert_eq!(rec.confidence_bps, 6000);
+}
+
+#[test]
+fn test_dispute_recommendation_inconclusive_below_threshold() {
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    // Both parties stay at the neutral default of 5000, so the difference is 0.
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.customer_score, 5000);
+    assert_eq!(rec.merchant_score, 5000);
+    assert_eq!(rec.recommendation, DisputeOutcome::Inconclusive);
+    assert_eq!(rec.confidence_bps, 0);
+}
+
+#[test]
+fn test_dispute_recommendation_does_not_enforce_resolution() {
+    // Confirms the recommendation is purely advisory: an admin can resolve
+    // against the recommended outcome and resolve_dispute still succeeds.
+    let env = Env::default();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    client.set_reputation_config(
+        &admin,
+        &ReputationConfig {
+            win_reward: 3000,
+            loss_penalty: 3000,
+            completion_reward: 0,
+            dispute_initiation_penalty: 0,
+        },
+    );
+
+    // Seed: merchant=8000, customer=2000.
+    let seed_id = client.create_escrow(&customer, &merchant, &500_i128, &token, &5000_u64, &0_u64);
+    client.dispute_escrow(&customer, &seed_id);
+    client.resolve_dispute(&admin, &seed_id, &true);
+
+    let escrow_id =
+        client.create_escrow(&customer, &merchant, &500_i128, &token, &10000_u64, &0_u64);
+    client.dispute_escrow(&customer, &escrow_id);
+
+    let rec = client.get_dispute_recommendation(&escrow_id);
+    assert_eq!(rec.recommendation, DisputeOutcome::FavorMerchant);
+
+    // Admin overrides the recommendation and resolves in the customer's favour.
+    client.resolve_dispute(&admin, &escrow_id, &false);
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Resolved);
+}
+
+// ── CONDITIONAL ESCROW (ON-CHAIN STATE) TESTS ────────────────────────────────
+
+#[contract]
+pub struct MockStateContract;
+
+#[contractimpl]
+impl MockStateContract {
+    pub fn set_state(env: Env, key: BytesN<32>, value: Bytes) {
+        env.storage().instance().set(&key, &value);
+    }
+
+    pub fn get_state(env: Env, key: BytesN<32>) -> Bytes {
+        env.storage()
+            .instance()
+            .get::<BytesN<32>, Bytes>(&key)
+            .unwrap_or(Bytes::new(&env))
+    }
+}
+
+#[test]
+fn test_conditional_escrow_release_on_condition_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[1u8; 32]);
+    let expected = Bytes::from_slice(&env, b"delivered");
+    state_client.set_state(&state_key, &expected);
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id,
+        state_key,
+        expected_value: expected,
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    let met = client.evaluate_and_release(&escrow_id);
+    assert!(met);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Released);
+
+    let conditional = client.get_conditional_escrow(&escrow_id);
+    assert!(conditional.evaluated);
+    assert!(conditional.result);
+}
+
+#[test]
+fn test_conditional_escrow_no_release_on_condition_not_met() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[2u8; 32]);
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"pending"));
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id,
+        state_key,
+        expected_value: Bytes::from_slice(&env, b"delivered"),
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    let met = client.evaluate_and_release(&escrow_id);
+    assert!(!met);
+
+    let escrow = client.get_escrow(&escrow_id);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+
+    let conditional = client.get_conditional_escrow(&escrow_id);
+    assert!(conditional.evaluated);
+    assert!(!conditional.result);
+}
+
+#[test]
+fn test_conditional_escrow_re_evaluation_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(EscrowContract, ());
+    let client = EscrowContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let state_contract_id = env.register(MockStateContract, ());
+    let state_client = MockStateContractClient::new(&env, &state_contract_id);
+
+    client.initialize(&admin);
+
+    let state_key = BytesN::from_array(&env, &[3u8; 32]);
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"pending"));
+
+    let condition = OnChainCondition {
+        contract_address: state_contract_id.clone(),
+        state_key: state_key.clone(),
+        expected_value: Bytes::from_slice(&env, b"delivered"),
+    };
+
+    let escrow_id =
+        client.create_conditional_escrow(&customer, &merchant, &token, &500_i128, &condition);
+
+    // First evaluation: not met.
+    let first = client.evaluate_and_release(&escrow_id);
+    assert!(!first);
+
+    // Even if state changes to a matching value, re-evaluation is rejected.
+    state_client.set_state(&state_key, &Bytes::from_slice(&env, b"delivered"));
+
+    let result = client.try_evaluate_and_release(&escrow_id);
+    assert_eq!(result, Err(Ok(Error::ConditionAlreadyEvaluated)));
 }
