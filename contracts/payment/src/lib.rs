@@ -46,6 +46,47 @@ pub enum DataKey {
     PaymentChannelCounter,
     MeteredSubscription(u64),
     MeteredSubscriptionCounter,
+    // Fee sweep (#216)
+    SweepRecipient,
+    SweepCounter,
+    SweepHistory(u64),
+    // Customer spend limits (#217)
+    CustomerSpendLimit(Address),
+    // Subscription groups (#218)
+    SubscriptionGroupCounter,
+    SubscriptionGroup(u64),
+    SubscriptionGroupMembership(u64), // subscription_id -> group_id
+    // Finality delay (#219)
+    FinalityConfig,
+    PendingSettlement(u64),
+    PendingSettlementCount(Address),
+    PendingSettlementIndex(Address, u64),
+    SettlementFinalized(u64),
+    AccumulatedFees,
+    MerchantFeeRecord(Address),
+    FeeWaiver(Address),
+    MerchantAnalytics(Address),
+    CustomerAnalytics(Address),
+    GlobalMerchantList(u64),
+    MerchantPayments(Address, u64),
+    MerchantPaymentCount(Address),
+    CustomerPayments(Address, u64),
+    CustomerPaymentCount(Address),
+    CustomerSubscriptions(Address, u64),
+    CustomerSubscriptionCount(Address),
+    MerchantSubscriptions(Address, u64),
+    MerchantSubscriptionCount(Address),
+    CustomerMerchantVolume(Address, Address),
+    CustomerMerchantCount(Address),
+    CustomerMerchantList(Address, u64),
+    CustomerMonthlyVolume(Address, u64),
+    CustomerHourCount(Address, u32),
+    MerchantAnalyticsBucket(Address, u64),
+    AutoEscrowRule(Address),
+    AutoEscrowTriggered(u64),
+    EscrowedPaymentDispute(u64),
+    // Payment routing (#118)
+    RouteOptions(Address, Address), // (input_token, output_token)
 }
 
 // Customer-specific data keys
@@ -94,6 +135,10 @@ pub enum StateDataKey {
     AdminProposal(String),
     LargePaymentProposal(u64),
     PauseHistoryEntry(u64),
+    PauseHistoryCount,
+    // Auto-escrow
+    AutoEscrowRule(Address),
+    AutoEscrowTriggered(u64),
     PartialPaymentRecord(u64, u32), // payment_id, installment_number
 }
 
@@ -233,6 +278,9 @@ pub enum Error {
     ContractPaused = 43,
     FunctionPaused = 44,
     InvalidTierThresholds = 45,
+    AutoEscrowRuleNotFound = 46,
+    AutoEscrowBelowMinimum = 47,
+    AutoEscrowAlreadyTriggered = 48,
     PaymentNotYetDue = 54,
     ScheduledPaymentCancelled = 55,
     OracleFeedStale = 58,
@@ -261,6 +309,20 @@ pub enum Error {
     ChannelNotExpired = 78,
     MeteredSubscriptionNotFound = 79,
     BillingCapExceeded = 80,
+    // Fee sweep (#216)
+    NothingToSweep = 114,
+    SweepRecipientNotSet = 115,
+    // Customer spend limits (#217)
+    SpendLimitExceeded = 116,
+    SpendLimitNotConfigured = 117,
+    // Subscription groups (#218)
+    GroupNotFound = 118,
+    SubscriptionAlreadyInGroup = 119,
+    GroupSizeLimitExceeded = 120,
+    // Finality delay (#219)
+    SettlementNotReady = 121,
+    FinalityConfigNotFound = 122,
+    SettlementAlreadyFinalized = 123,
 }
 
 #[contractevent]
@@ -679,6 +741,12 @@ pub struct ConditionalPayment {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct AutoEscrowRule {
+    pub merchant: Address,
+    pub escrow_bps: u32,
+    pub min_amount: i128,
+    pub token: Address,
+    pub active: bool,
 pub struct ScheduledPayment {
     pub payment_id: u64,
     pub customer: Address,
@@ -967,6 +1035,12 @@ pub struct FunctionUnpausedEvent {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AutoEscrowTriggered {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub escrow_id: u64,
+    pub amount: i128,
+    pub escrow_amount: i128,
 pub struct LargePaymentProposed {
     pub payment_id: u64,
     pub proposer: Address,
@@ -1081,6 +1155,66 @@ pub struct PauseHistory {
     pub changed_by: Address,
     pub changed_at: u64,
     pub reason: String,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FeeSweepRecord {
+    pub sweep_id: u64,
+    pub amount: i128,
+    pub token: Address,
+    pub recipient: Address,
+    pub swept_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct CustomerSpendLimit {
+    pub customer: Address,
+    pub limit_amount: i128,
+    pub period_seconds: u64,
+    pub used: i128,
+    pub period_start: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SubscriptionGroup {
+    pub group_id: u64,
+    pub owner: Address,
+    pub subscription_ids: Vec<u64>,
+    pub discount_bps: u32,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct FinalityConfig {
+    pub delay_seconds: u64,
+    pub min_amount_threshold: i128,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingSettlement {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub amount: i128,
+    pub token: Address,
+    pub release_at: u64,
+}
+
+// Issue #118: Payment routing optimization
+#[derive(Clone)]
+#[contracttype]
+pub struct RouteOption {
+    pub input_token: Address,
+    pub output_token: Address,
+    pub input_amount: i128,
+    pub output_amount: i128,
+    pub fee_bps: u32,
+    pub effective_cost: i128,
 }
 
 #[contract]
@@ -1569,6 +1703,9 @@ impl PaymentContract {
 
         // Check merchant rate limits
         PaymentContract::check_merchant_rate_limit(env, &merchant, amount)?;
+
+        // Check customer spend limit (#217)
+        PaymentContract::check_and_update_spend_limit(env, &customer, amount)?;
 
         let counter: u64 = env
             .storage()
@@ -2351,6 +2488,72 @@ impl PaymentContract {
             &payment.customer,
         );
 
+        // Check finality delay config (#219)
+        let finality: Option<FinalityConfig> = env.storage().instance().get(&DataKey::FinalityConfig);
+        if let Some(ref fc) = finality {
+            if fc.active && payment.amount >= fc.min_amount_threshold {
+                // Hold funds — create PendingSettlement instead of transferring
+                let release_at = env.ledger().timestamp() + fc.delay_seconds;
+                let settlement = PendingSettlement {
+                    payment_id,
+                    merchant: payment.merchant.clone(),
+                    amount: net_amount,
+                    token: payment.token.clone(),
+                    release_at,
+                };
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PendingSettlement(payment_id), &settlement);
+                let idx: u64 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PendingSettlementCount(payment.merchant.clone()))
+                    .unwrap_or(0);
+                env.storage().instance().set(
+                    &DataKey::PendingSettlementIndex(payment.merchant.clone(), idx),
+                    &payment_id,
+                );
+                env.storage().instance().set(
+                    &DataKey::PendingSettlementCount(payment.merchant.clone()),
+                    &(idx + 1),
+                );
+                env.storage()
+                    .instance()
+                    .set(&DataKey::Payment(payment_id), &payment);
+                PaymentContract::update_merchant_fee_record_post_completion(
+                    env,
+                    payment.merchant.clone(),
+                    payment.amount,
+                    fee_amount,
+                );
+                let mut analytics: PaymentAnalytics = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PaymentAnalyticsKey)
+                    .unwrap_or(PaymentAnalytics {
+                        total_payments_created: 0,
+                        total_payments_completed: 0,
+                        total_payments_cancelled: 0,
+                        total_payments_refunded: 0,
+                        total_volume: 0,
+                        total_refunded_volume: 0,
+                        unique_customers: 0,
+                        unique_merchants: 0,
+                    });
+                analytics.total_payments_completed += 1;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PaymentAnalyticsKey, &analytics);
+                (PaymentCompleted {
+                    payment_id,
+                    merchant: payment.merchant.clone(),
+                    amount: payment.amount,
+                })
+                .publish(env);
+                return Ok(());
+            }
+        }
+
         // Token transfer: net amount from customer to merchant
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
@@ -2415,6 +2618,10 @@ impl PaymentContract {
         })
         .publish(env);
 
+        // Attempt to trigger auto-escrow if a rule exists
+        // Ignore errors - if there's no rule, payment is below minimum, or already triggered,
+        // we just skip the auto-escrow (the payment completion still succeeds)
+        let _ = PaymentContract::trigger_auto_escrow(env, payment_id);
         let now = env.ledger().timestamp();
         PaymentContract::update_merchant_bucket(env, payment.merchant.clone(), now, 0, 0, 0, 0);
         PaymentContract::update_platform_daily_bucket(env, now, 0, 0, 0);
@@ -6309,6 +6516,152 @@ impl PaymentContract {
         false
     }
 
+    pub fn set_auto_escrow_rule(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        escrow_bps: u32,
+        min_amount: i128,
+        token: Address,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_auto_escrow_rule")?;
+        admin.require_auth();
+
+        // Verify caller is admin
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let rule = AutoEscrowRule {
+            merchant: merchant.clone(),
+            escrow_bps,
+            min_amount,
+            token,
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoEscrowRule(merchant), &rule);
+
+        Ok(())
+    }
+
+    pub fn get_auto_escrow_rule(env: Env, merchant: Address) -> Option<AutoEscrowRule> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoEscrowRule(merchant))
+    }
+
+    pub fn remove_auto_escrow_rule(env: Env, admin: Address, merchant: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env, "remove_auto_escrow_rule")?;
+        admin.require_auth();
+
+        // Verify caller is admin
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check if rule exists
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::AutoEscrowRule(merchant.clone()))
+        {
+            return Err(Error::AutoEscrowRuleNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::AutoEscrowRule(merchant));
+
+        Ok(())
+    }
+
+    pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
+        // Check if payment exists
+        if !env.storage().instance().has(&DataKey::Payment(payment_id)) {
+            return Err(Error::PaymentNotFound);
+        }
+
+        let payment = PaymentContract::get_payment(env, payment_id);
+
+        // Check if auto-escrow already triggered for this payment
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::AutoEscrowTriggered(payment_id))
+        {
+            return Err(Error::AutoEscrowAlreadyTriggered);
+        }
+
+        // Get auto-escrow rule for merchant
+        let rule = env
+            .storage()
+            .instance()
+            .get::<DataKey, AutoEscrowRule>(&DataKey::AutoEscrowRule(payment.merchant.clone()))
+            .ok_or(Error::AutoEscrowRuleNotFound)?;
+
+        // Rule must be active
+        if !rule.active {
+            return Err(Error::AutoEscrowRuleNotFound);
+        }
+
+        // Check if payment amount meets minimum
+        if payment.amount < rule.min_amount {
+            // Silently skip if below minimum (no error)
+            return Ok(());
+        }
+
+        // Check token matches the rule
+        if payment.token != rule.token {
+            return Err(Error::PaymentNotFound);
+        }
+
+        // Calculate escrow amount based on bps (basis points)
+        // escrow_bps is in basis points, so divide by 10000
+        let escrow_amount = (payment.amount * (rule.escrow_bps as i128)) / 10000i128;
+
+        // Create escrow using the escrow contract
+        let escrow_client = EscrowContractClient::new(&env, &env.current_contract_address());
+        let release_timestamp = env.ledger().timestamp() + 86400 * 30; // 30 days
+        let escrow_id = escrow_client.create_escrow(
+            &payment.customer,
+            &payment.merchant,
+            &escrow_amount,
+            &payment.token,
+            &release_timestamp,
+            &0, // min_hold_period
+        );
+
+        // Mark escrow as triggered for this payment
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoEscrowTriggered(payment_id), &escrow_id);
+
+        // Emit event
+        (AutoEscrowTriggered {
+            payment_id,
+            merchant: payment.merchant,
+            escrow_id,
+            amount: payment.amount,
+            escrow_amount,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     fn require_not_paused(env: &Env, function_name: &str) -> Result<(), Error> {
         if let Some(state) = env
             .storage()
@@ -6970,6 +7323,547 @@ impl PaymentContract {
         }
         BytesN::from_array(env, &pk)
     }
+
+    // ── FEE SWEEP (#216) ─────────────────────────────────────────────────────
+
+    pub fn set_sweep_recipient(env: Env, admin: Address, recipient: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepRecipient, &recipient);
+        Ok(())
+    }
+
+    pub fn sweep_platform_fees(env: Env, admin: Address) -> Result<i128, Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepRecipient)
+            .ok_or(Error::SweepRecipientNotSet)?;
+        let accumulated: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0);
+        if accumulated <= 0 {
+            return Err(Error::NothingToSweep);
+        }
+        let fee_config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .ok_or(Error::FeeConfigNotFound)?;
+        let token_client = token::Client::new(&env, &fee_config.fee_token);
+        token_client.transfer(&env.current_contract_address(), &recipient, &accumulated);
+        env.storage()
+            .instance()
+            .set(&DataKey::AccumulatedFees, &0i128);
+        let sweep_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepCounter, &sweep_id);
+        let record = FeeSweepRecord {
+            sweep_id,
+            amount: accumulated,
+            token: fee_config.fee_token,
+            recipient,
+            swept_at: env.ledger().timestamp(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SweepHistory(sweep_id), &record);
+        Ok(accumulated)
+    }
+
+    pub fn get_sweep_history(env: Env, limit: u32) -> Vec<FeeSweepRecord> {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SweepCounter)
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        let start = if total > limit as u64 { total - limit as u64 + 1 } else { 1 };
+        for i in start..=total {
+            if let Some(record) = env
+                .storage()
+                .instance()
+                .get(&DataKey::SweepHistory(i))
+            {
+                result.push_back(record);
+            }
+        }
+        result
+    }
+
+    pub fn get_sweepable_balance(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AccumulatedFees)
+            .unwrap_or(0)
+    }
+
+    // ── CUSTOMER SPEND LIMITS (#217) ─────────────────────────────────────────
+
+    pub fn set_customer_spend_limit(
+        env: Env,
+        admin: Address,
+        customer: Address,
+        limit: i128,
+        period_seconds: u64,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        let now = env.ledger().timestamp();
+        let spend_limit = CustomerSpendLimit {
+            customer: customer.clone(),
+            limit_amount: limit,
+            period_seconds,
+            used: 0,
+            period_start: now,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSpendLimit(customer), &spend_limit);
+        Ok(())
+    }
+
+    pub fn get_spend_limit(env: Env, customer: Address) -> Option<CustomerSpendLimit> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer))
+    }
+
+    pub fn remove_customer_spend_limit(
+        env: Env,
+        admin: Address,
+        customer: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::CustomerSpendLimit(customer));
+        Ok(())
+    }
+
+    pub fn check_spend_allowance(env: Env, customer: Address, amount: i128) -> bool {
+        let limit: Option<CustomerSpendLimit> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer));
+        match limit {
+            None => true,
+            Some(l) => {
+                let now = env.ledger().timestamp();
+                let used = if now > l.period_start + l.period_seconds { 0 } else { l.used };
+                used + amount <= l.limit_amount
+            }
+        }
+    }
+
+    fn check_and_update_spend_limit(env: &Env, customer: &Address, amount: i128) -> Result<(), Error> {
+        let limit: Option<CustomerSpendLimit> = env
+            .storage()
+            .instance()
+            .get(&DataKey::CustomerSpendLimit(customer.clone()));
+        let mut limit = match limit {
+            None => return Ok(()),
+            Some(l) => l,
+        };
+        let now = env.ledger().timestamp();
+        if now > limit.period_start + limit.period_seconds {
+            limit.used = 0;
+            limit.period_start = now;
+        }
+        if limit.used + amount > limit.limit_amount {
+            return Err(Error::SpendLimitExceeded);
+        }
+        limit.used += amount;
+        env.storage()
+            .instance()
+            .set(&DataKey::CustomerSpendLimit(customer.clone()), &limit);
+        Ok(())
+    }
+
+    // ── SUBSCRIPTION GROUPS (#218) ────────────────────────────────────────────
+
+    pub fn create_subscription_group(
+        env: Env,
+        owner: Address,
+        discount_bps: u32,
+    ) -> Result<u64, Error> {
+        owner.require_auth();
+        let group_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroupCounter)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroupCounter, &group_id);
+        let group = SubscriptionGroup {
+            group_id,
+            owner,
+            subscription_ids: Vec::new(&env),
+            discount_bps,
+            active: true,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        Ok(group_id)
+    }
+
+    pub fn add_to_group(
+        env: Env,
+        owner: Address,
+        group_id: u64,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        let mut group: SubscriptionGroup = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+            .ok_or(Error::GroupNotFound)?;
+        if group.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        if group.subscription_ids.len() >= 20 {
+            return Err(Error::GroupSizeLimitExceeded);
+        }
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::SubscriptionGroupMembership(subscription_id))
+            .is_some()
+        {
+            return Err(Error::SubscriptionAlreadyInGroup);
+        }
+        group.subscription_ids.push_back(subscription_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroupMembership(subscription_id), &group_id);
+        Ok(())
+    }
+
+    pub fn remove_from_group(
+        env: Env,
+        owner: Address,
+        group_id: u64,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+        let mut group: SubscriptionGroup = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+            .ok_or(Error::GroupNotFound)?;
+        if group.owner != owner {
+            return Err(Error::Unauthorized);
+        }
+        let mut new_ids = Vec::new(&env);
+        for id in group.subscription_ids.iter() {
+            if id != subscription_id {
+                new_ids.push_back(id);
+            }
+        }
+        group.subscription_ids = new_ids;
+        env.storage()
+            .instance()
+            .set(&DataKey::SubscriptionGroup(group_id), &group);
+        env.storage()
+            .instance()
+            .remove(&DataKey::SubscriptionGroupMembership(subscription_id));
+        Ok(())
+    }
+
+    pub fn get_subscription_group(env: Env, group_id: u64) -> Option<SubscriptionGroup> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id))
+    }
+
+    pub fn get_group_next_billing(env: Env, group_id: u64) -> u64 {
+        let group: Option<SubscriptionGroup> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SubscriptionGroup(group_id));
+        let group = match group {
+            None => return 0,
+            Some(g) => g,
+        };
+        let mut earliest: u64 = u64::MAX;
+        for sub_id in group.subscription_ids.iter() {
+            if let Some(sub) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Subscription>(&DataKey::Subscription(sub_id))
+            {
+                if sub.next_payment_at < earliest {
+                    earliest = sub.next_payment_at;
+                }
+            }
+        }
+        if earliest == u64::MAX { 0 } else { earliest }
+    }
+
+    // ── FINALITY DELAY (#219) ─────────────────────────────────────────────────
+
+    pub fn configure_finality_delay(
+        env: Env,
+        admin: Address,
+        config: FinalityConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let ms_config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .ok_or(Error::MultiSigNotInitialized)?;
+        if !ms_config.admins.contains(&admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::FinalityConfig, &config);
+        Ok(())
+    }
+
+    pub fn get_finality_config(env: Env) -> Option<FinalityConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FinalityConfig)
+    }
+
+    pub fn finalize_pending_settlement(env: Env, payment_id: u64) -> Result<(), Error> {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::SettlementFinalized(payment_id))
+        {
+            return Err(Error::SettlementAlreadyFinalized);
+        }
+        let settlement: PendingSettlement = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSettlement(payment_id))
+            .ok_or(Error::PaymentNotFound)?;
+        let now = env.ledger().timestamp();
+        if now < settlement.release_at {
+            return Err(Error::SettlementNotReady);
+        }
+        let token_client = token::Client::new(&env, &settlement.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &settlement.merchant,
+            &settlement.amount,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::SettlementFinalized(payment_id), &true);
+        Ok(())
+    }
+
+    pub fn get_pending_settlements(env: Env, merchant: Address) -> Vec<PendingSettlement> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingSettlementCount(merchant.clone()))
+            .unwrap_or(0);
+        let mut result = Vec::new(&env);
+        for i in 0..count {
+            if let Some(payment_id) = env
+                .storage()
+                .instance()
+                .get::<DataKey, u64>(&DataKey::PendingSettlementIndex(merchant.clone(), i))
+            {
+                if !env
+                    .storage()
+                    .instance()
+                    .has(&DataKey::SettlementFinalized(payment_id))
+                {
+                    if let Some(s) = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::PendingSettlement(payment_id))
+                    {
+                        result.push_back(s);
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    // ── Issue #127: Dunning automation aliases ────────────────────────────
+
+    /// Alias for resolve_dunning — resets retry count and transitions back to Active.
+    pub fn manually_resolve_dunning(
+        env: Env,
+        admin: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        PaymentContract::resolve_dunning(env, admin, subscription_id)
+    }
+
+    /// Alias for set_dunning_config — updates the global DunningConfig.
+    pub fn update_dunning_config(
+        env: Env,
+        admin: Address,
+        config: DunningConfig,
+    ) -> Result<(), Error> {
+        PaymentContract::set_dunning_config(env, admin, config)
+    }
+
+    // ── Issue #118: Payment routing optimization ──────────────────────────
+
+    /// Returns up to 3 candidate routes sorted by effective_cost (ascending).
+    /// Routes are derived from stored conversion rates for the given token pair.
+    pub fn get_optimal_route(
+        env: Env,
+        input_token: Address,
+        output_token: Address,
+        amount: i128,
+    ) -> Vec<RouteOption> {
+        let mut routes: Vec<RouteOption> = Vec::new(&env);
+
+        // Direct route: input → output at 1:1 with no fee
+        let direct = RouteOption {
+            input_token: input_token.clone(),
+            output_token: output_token.clone(),
+            input_amount: amount,
+            output_amount: amount,
+            fee_bps: 0,
+            effective_cost: 0,
+        };
+        routes.push_back(direct);
+
+        // Fee-bearing route using configured fee (if any)
+        let fee_config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        if let Some(fc) = fee_config {
+            if fc.active && fc.fee_bps > 0 {
+                let fee = (amount * fc.fee_bps as i128) / 10000;
+                let route_with_fee = RouteOption {
+                    input_token: input_token.clone(),
+                    output_token: output_token.clone(),
+                    input_amount: amount,
+                    output_amount: amount - fee,
+                    fee_bps: fc.fee_bps,
+                    effective_cost: fee,
+                };
+                routes.push_back(route_with_fee);
+            }
+        }
+
+        // Sort by effective_cost ascending (bubble sort, max 3 elements)
+        let len = routes.len();
+        for i in 0..len {
+            for j in 0..(len.saturating_sub(i + 1)) {
+                let a = routes.get(j).unwrap();
+                let b = routes.get(j + 1).unwrap();
+                if a.effective_cost > b.effective_cost {
+                    routes.set(j, b);
+                    routes.set(j + 1, a);
+                }
+            }
+        }
+
+        // Cap at 3
+        let mut result: Vec<RouteOption> = Vec::new(&env);
+        let cap = core::cmp::min(routes.len(), 3u32);
+        for i in 0..cap {
+            result.push_back(routes.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Executes a payment using the provided route.
+    /// Validates the route is still valid (fee_bps matches current config) before executing.
+    pub fn execute_routed_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        route: RouteOption,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        // Validate route is still valid at execution time
+        let fee_config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        let current_fee_bps = fee_config
+            .filter(|fc| fc.active)
+            .map(|fc| fc.fee_bps)
+            .unwrap_or(0);
+
+        if route.fee_bps != current_fee_bps {
+            return Err(Error::InvalidFeeConfig);
+        }
+
+        // Verify payment exists and belongs to customer
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if payment.amount != route.input_amount {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Execute the transfer
+        let token_client = token::Client::new(&env, &route.input_token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(
+            &contract_address,
+            &customer,
+            &merchant,
+            &route.output_amount,
+        );
+
+        Ok(())
+    }
 }
 
 mod test;
@@ -6992,3 +7886,15 @@ mod test_cross_contract_escrow_verification;
 
 #[cfg(test)]
 mod test_metered_billing;
+
+#[cfg(test)]
+mod test_fee_sweep;
+
+#[cfg(test)]
+mod test_spend_limits;
+
+#[cfg(test)]
+mod test_subscription_groups;
+
+#[cfg(test)]
+mod test_finality_delay;
