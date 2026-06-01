@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -70,6 +70,8 @@ pub enum DataKey {
     // Migration
     MigrationStatusKey,
     EscrowMigrated(u64),
+    // Escrow health / stale detection
+    StaleThresholdConfigKey,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,6 +105,32 @@ pub struct EscrowFeeConfig {
     pub fee_bps: i128,
     pub fee_recipient: Address,
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EscrowHealth {
+    Healthy,
+    NearExpiry,
+    Stale,
+    Disputed,
+    Expired,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowHealthReport {
+    pub escrow_id: u64,
+    pub health: EscrowHealth,
+    pub seconds_until_expiry: Option<i64>,
+    pub last_activity: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct StaleThresholdConfig {
+    pub inactivity_seconds: u64,
+    pub near_expiry_buffer_seconds: u64,
 }
 
 #[contractevent]
@@ -210,6 +238,8 @@ pub enum Error {
     MigrationNotStarted = 63,
     MigrationAlreadyComplete = 64,
     AlreadyMigrated = 65,
+    // 63 is already taken by MigrationNotStarted; use next free code.
+    StaleThresholdNotConfigured = 66,
 }
 
 #[contractevent]
@@ -6517,6 +6547,123 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::MerchantAnalytics(merchant.clone()), &analytics);
     }
+
+    /// Configure the thresholds used to classify escrow health (admin only).
+    ///
+    /// `inactivity_seconds` controls when a non-terminal escrow is considered
+    /// `Stale`, and `near_expiry_buffer_seconds` controls when one is flagged
+    /// `NearExpiry`.
+    pub fn set_stale_threshold(
+        env: Env,
+        admin: Address,
+        config: StaleThresholdConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::StaleThresholdConfigKey, &config);
+        Ok(())
+    }
+
+    /// Returns the configured stale-threshold config, or `None` if unset.
+    pub fn get_stale_threshold(env: Env) -> Option<StaleThresholdConfig> {
+        env.storage()
+            .instance()
+            .get(&DataKey::StaleThresholdConfigKey)
+    }
+
+    /// Classify the health of a single escrow against the configured thresholds.
+    ///
+    /// Panics with `EscrowNotFound` if the escrow does not exist, or
+    /// `StaleThresholdNotConfigured` if `set_stale_threshold` was never called.
+    pub fn get_escrow_health(env: Env, escrow_id: u64) -> EscrowHealthReport {
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            panic_with_error!(&env, Error::EscrowNotFound);
+        }
+        let config = Self::require_stale_threshold(&env);
+        let escrow = Self::get_escrow(&env, escrow_id);
+        let now = env.ledger().timestamp();
+
+        let seconds_until_expiry: Option<i64> = if escrow.expiry_timestamp == 0 {
+            None
+        } else {
+            Some(escrow.expiry_timestamp as i64 - now as i64)
+        };
+
+        EscrowHealthReport {
+            escrow_id,
+            health: Self::classify_health(&escrow, now, &config),
+            seconds_until_expiry,
+            last_activity: escrow.last_activity_at,
+        }
+    }
+
+    /// Returns at most `limit` IDs of escrows currently classified as `Stale`.
+    ///
+    /// Panics with `StaleThresholdNotConfigured` if thresholds are not set.
+    pub fn get_stale_escrows(env: Env, limit: u32) -> Vec<u64> {
+        let config = Self::require_stale_threshold(&env);
+        let now = env.ledger().timestamp();
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowCounter)
+            .unwrap_or(0);
+
+        let mut result = Vec::new(&env);
+        let mut id: u64 = 1;
+        while id <= counter && (result.len() as u32) < limit {
+            if let Some(escrow) = env
+                .storage()
+                .instance()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(id))
+            {
+                if Self::classify_health(&escrow, now, &config) == EscrowHealth::Stale {
+                    result.push_back(id);
+                }
+            }
+            id += 1;
+        }
+        result
+    }
+
+    fn require_stale_threshold(env: &Env) -> StaleThresholdConfig {
+        match env
+            .storage()
+            .instance()
+            .get::<DataKey, StaleThresholdConfig>(&DataKey::StaleThresholdConfigKey)
+        {
+            Some(config) => config,
+            None => panic_with_error!(env, Error::StaleThresholdNotConfigured),
+        }
+    }
+
+    /// Pure classification of an escrow's health given the current time and config.
+    ///
+    /// Precedence: Disputed > Expired > NearExpiry > Stale > Healthy.
+    fn classify_health(escrow: &Escrow, now: u64, config: &StaleThresholdConfig) -> EscrowHealth {
+        if escrow.status == EscrowStatus::Disputed {
+            return EscrowHealth::Disputed;
+        }
+        if escrow.expiry_timestamp != 0 && now >= escrow.expiry_timestamp {
+            return EscrowHealth::Expired;
+        }
+        if escrow.expiry_timestamp != 0
+            && escrow.expiry_timestamp - now <= config.near_expiry_buffer_seconds
+        {
+            return EscrowHealth::NearExpiry;
+        }
+        if now >= escrow.last_activity_at
+            && now - escrow.last_activity_at >= config.inactivity_seconds
+        {
+            return EscrowHealth::Stale;
+        }
+        EscrowHealth::Healthy
+    }
 }
 
 impl EscrowAnalytics {
@@ -6566,3 +6713,6 @@ mod escalation_timeout_test;
 #[cfg(test)]
 mod bulk_evidence_test;
 mod migration_test;
+
+#[cfg(test)]
+mod health_check_test;
