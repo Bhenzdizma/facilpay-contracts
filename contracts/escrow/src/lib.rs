@@ -87,6 +87,10 @@ pub enum DataKey {
     DisputeAppealCounter,
     DisputeRoundKey(u64),
     AppealsByEscrow(u64, u64),
+    // Escrow renewal mechanism
+    EscrowRenewalConfig,
+    EscrowRenewal(u64),
+    EscrowRenewalCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +162,7 @@ pub struct InsuranceConfig {
     pub enabled: bool,
 }
 
+#[derive(Clone)]
 #[contracttype]
 pub struct InsuranceClaim {
     pub claim_id: u64,
@@ -166,6 +171,30 @@ pub struct InsuranceClaim {
     pub amount: i128,
     pub approved: bool,
     pub paid_at: Option<u64>,
+}
+
+/// Configuration for escrow renewal mechanism
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewalConfig {
+    pub enabled: bool,
+    pub max_renewals: u32,           // Maximum number of times an escrow can be renewed
+    pub renewal_fee_bps: u32,        // Fee in basis points for renewal
+    pub min_renewal_period: u64,     // Minimum renewal period in seconds
+    pub max_renewal_period: u64,     // Maximum renewal period in seconds
+}
+
+/// Tracks escrow renewal history
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowRenewal {
+    pub renewal_id: u64,
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewed_at: u64,
+    pub renewal_count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -375,6 +404,22 @@ pub struct EvidenceSubmitted {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineSet {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub set_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceDeadlineExceeded {
+    pub escrow_id: u64,
+    pub deadline: u64,
+    pub submitted_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisputeEscalated {
     pub escrow_id: u64,
     pub level: u64,
@@ -405,6 +450,28 @@ pub struct AppealResolved {
     pub escrow_id: u64,
     pub in_favor_of: Address,
     pub resolved_at: u64,
+}
+
+/// Event emitted when an escrow is renewed
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewed {
+    pub escrow_id: u64,
+    pub renewed_by: Address,
+    pub new_expiry_timestamp: u64,
+    pub renewal_fee: i128,
+    pub renewal_count: u32,
+}
+
+/// Event emitted when escrow renewal configuration is updated
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowRenewalConfigUpdated {
+    pub max_renewals: u32,
+    pub renewal_fee_bps: u32,
+    pub min_renewal_period: u64,
+    pub max_renewal_period: u64,
+    pub updated_by: Address,
 }
 
 #[derive(Clone)]
@@ -580,6 +647,7 @@ pub struct Escrow {
     pub escalated_at: Option<u64>,
     pub escalation_timeout: u64,
     pub auto_resolve_in_favor_of: AutoResolveFavor,
+    pub evidence_deadline: Option<u64>, // Deadline for evidence submission in dispute
 }
 
 #[derive(Clone)]
@@ -2636,6 +2704,16 @@ impl EscrowContract {
                 escrow.status = EscrowStatus::Disputed;
                 escrow.dispute_started_at = env.ledger().timestamp();
                 escrow.last_activity_at = escrow.dispute_started_at;
+                // Set evidence submission deadline to 7 days from dispute start
+                let evidence_deadline_seconds = 7 * 24 * 60 * 60; // 7 days
+                escrow.evidence_deadline = Some(escrow.dispute_started_at + evidence_deadline_seconds);
+                
+                EvidenceDeadlineSet {
+                    escrow_id,
+                    deadline: escrow.evidence_deadline.unwrap(),
+                    set_at: escrow.dispute_started_at,
+                }
+                .publish(&env);
             }
             EscrowStatus::Released => return Err(Error::AlreadyProcessed),
             EscrowStatus::Disputed => return Err(Error::AlreadyProcessed),
@@ -2699,6 +2777,21 @@ impl EscrowContract {
         if escrow.customer != caller && escrow.merchant != caller {
             return Err(Error::Unauthorized);
         }
+        
+        // Check evidence submission deadline
+        if let Some(deadline) = escrow.evidence_deadline {
+            let current_time = env.ledger().timestamp();
+            if current_time > deadline {
+                EvidenceDeadlineExceeded {
+                    escrow_id,
+                    deadline,
+                    submitted_at: current_time,
+                }
+                .publish(&env);
+                return Err(Error::EvidenceDeadlinePassed);
+            }
+        }
+        
         EscrowContract::append_evidence_entry(&env, escrow_id, caller, ipfs_hash)
     }
 
