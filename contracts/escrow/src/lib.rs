@@ -6,6 +6,18 @@ use soroban_sdk::{
 
 #[derive(Clone)]
 #[contracttype]
+pub enum AdminKey {
+    MultiSigConfig,
+    AdminProposal(String),
+    ProposalCounter,
+    SuccessionPlan,
+    ClawbackRequest(u64),
+    ClawbackCounter,
+    EscrowClawback(u64),
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub enum DataKey {
     Escrow(u64),
     EscrowCounter,
@@ -23,9 +35,6 @@ pub enum DataKey {
     ReputationConfig,
     VestingSchedule(u64),
     VestingAccelerationConfig(u64),
-    MultiSigConfig,
-    AdminProposal(String),
-    ProposalCounter,
     TimeLockAction(u64),
     TimeLockCounter,
     TimeLockConfig,
@@ -63,7 +72,6 @@ pub enum DataKey {
     MultiPartyDisputeKey(u64),
     // Conditional escrow (on-chain state)
     ConditionalEscrow(u64),
-    SuccessionPlan,
     GlobalExpiryConfig,
     EscalationConfig,
     EscrowEvidencePage(u64, u32),
@@ -188,6 +196,23 @@ pub struct InsuranceClaim {
     pub paid_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum SuccessionError {
+    Exists = 0,
+    NotFound = 1,
+    AlreadyActivated = 2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum ClawbackError {
+    DelayNotMet = 0,
+    AlreadyExecuted = 1,
+    AlreadyInitiated = 2,
+    Cancelled = 3,
+}
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
@@ -231,22 +256,21 @@ pub enum Error {
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
     ConditionAlreadyEvaluated = 51,
-    SuccessionPlanExists = 52,
-    SuccessionPlanNotFound = 53,
-    SuccessionAlreadyActivated = 54,
+    SuccessionError(SuccessionError) = 52,
     InvalidMerkleProof = 34,
     RootAlreadyCommitted = 38,
     NoEvidenceRoot = 39,
     EmptyPauseReason = 55,
     InvalidWeightSum = 56,
     InvalidThreshold = 57,
-    ParticipantNotFound = 59,
-    EscrowNotExpired = 60,
-    EscrowAlreadyExpired = 61,
-    ExpiryBeforeRelease = 62,
+    ClawbackError(ClawbackError) = 59,
     MigrationNotStarted = 63,
     MigrationAlreadyComplete = 64,
     AlreadyMigrated = 65,
+    ParticipantNotFound = 66,
+    EscrowNotExpired = 67,
+    EscrowAlreadyExpired = 68,
+    ExpiryBeforeRelease = 69,
     TemplateNotFound = 70,
     TemplateInactive = 71,
     InitiationDeadlinePassed = 69,
@@ -742,7 +766,7 @@ pub enum ActionType {
     AddAdmin,
     RemoveAdmin,
     UpdateRequiredSignatures,
-    UpdateThreshold { new_threshold: u32 },
+    UpdateThreshold(u32),
 }
 
 #[derive(Clone)]
@@ -778,6 +802,18 @@ pub struct AdminProposal {
     pub rejected: bool,
     pub created_at: u64,
     pub expires_at: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct ClawbackRequest {
+    pub request_id: u64,
+    pub escrow_id: u64,
+    pub initiated_by: Address,
+    pub reason_hash: BytesN<32>,
+    pub execute_after: u64,
+    pub executed: bool,
+    pub cancelled: bool,
 }
 
 #[contracttype]
@@ -1207,7 +1243,7 @@ pub struct EscrowContract;
 #[contractimpl]
 impl EscrowContract {
     pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::MultiSigConfig) {
+        if env.storage().instance().has(&AdminKey::MultiSigConfig) {
             panic!("already initialized");
         }
         let config = MultiSigConfig {
@@ -1218,7 +1254,7 @@ impl EscrowContract {
         };
         env.storage()
             .instance()
-            .set(&DataKey::MultiSigConfig, &config);
+            .set(&AdminKey::MultiSigConfig, &config);
         AdminAdded { admin }.publish(&env);
     }
 
@@ -1298,7 +1334,7 @@ impl EscrowContract {
     pub fn get_multisig_config(env: Env) -> MultiSigConfig {
         env.storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .expect("MultiSig not initialized")
     }
 
@@ -1314,7 +1350,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         if !config.admins.contains(&proposer) {
@@ -1324,12 +1360,12 @@ impl EscrowContract {
         let counter: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::ProposalCounter)
+            .get(&AdminKey::ProposalCounter)
             .unwrap_or(0)
             + 1;
         env.storage()
             .instance()
-            .set(&DataKey::ProposalCounter, &counter);
+            .set(&AdminKey::ProposalCounter, &counter);
 
         let proposal_id = EscrowContract::u64_to_string(&env, counter);
         let now = env.ledger().timestamp();
@@ -1353,7 +1389,7 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+            .set(&AdminKey::AdminProposal(proposal_id.clone()), &proposal);
 
         ActionProposed {
             proposal_id: proposal_id.clone(),
@@ -1371,7 +1407,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         if !config.admins.contains(&approver) {
@@ -1381,7 +1417,7 @@ impl EscrowContract {
         let mut proposal: AdminProposal = env
             .storage()
             .instance()
-            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .get(&AdminKey::AdminProposal(proposal_id.clone()))
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed || proposal.rejected {
@@ -1401,7 +1437,7 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+            .set(&AdminKey::AdminProposal(proposal_id.clone()), &proposal);
 
         ActionApproved {
             proposal_id,
@@ -1417,13 +1453,13 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         let mut proposal: AdminProposal = env
             .storage()
             .instance()
-            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .get(&AdminKey::AdminProposal(proposal_id.clone()))
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed || proposal.rejected {
@@ -1441,7 +1477,7 @@ impl EscrowContract {
         proposal.executed = true;
         env.storage()
             .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+            .set(&AdminKey::AdminProposal(proposal_id.clone()), &proposal);
 
         EscrowContract::dispatch_action(&env, &proposal)?;
 
@@ -1456,7 +1492,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         if !config.admins.contains(&rejecter) {
@@ -1466,7 +1502,7 @@ impl EscrowContract {
         let mut proposal: AdminProposal = env
             .storage()
             .instance()
-            .get(&DataKey::AdminProposal(proposal_id.clone()))
+            .get(&AdminKey::AdminProposal(proposal_id.clone()))
             .ok_or(Error::ProposalNotFound)?;
 
         if proposal.executed || proposal.rejected {
@@ -1476,7 +1512,7 @@ impl EscrowContract {
         proposal.rejected = true;
         env.storage()
             .instance()
-            .set(&DataKey::AdminProposal(proposal_id.clone()), &proposal);
+            .set(&AdminKey::AdminProposal(proposal_id.clone()), &proposal);
 
         ActionRejected {
             proposal_id,
@@ -1493,7 +1529,7 @@ impl EscrowContract {
         let mut config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         if !config.admins.contains(&caller) {
@@ -1505,7 +1541,7 @@ impl EscrowContract {
             config.total_admins += 1;
             env.storage()
                 .instance()
-                .set(&DataKey::MultiSigConfig, &config);
+                .set(&AdminKey::MultiSigConfig, &config);
             AdminAdded { admin: new_admin }.publish(&env);
         }
 
@@ -1518,7 +1554,7 @@ impl EscrowContract {
         let mut config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
 
         if !config.admins.contains(&caller) {
@@ -1544,7 +1580,7 @@ impl EscrowContract {
         config.total_admins -= 1;
         env.storage()
             .instance()
-            .set(&DataKey::MultiSigConfig, &config);
+            .set(&AdminKey::MultiSigConfig, &config);
         AdminRemoved { admin }.publish(&env);
 
         Ok(())
@@ -1577,10 +1613,10 @@ impl EscrowContract {
         if let Some(existing) = env
             .storage()
             .instance()
-            .get::<DataKey, SuccessionPlan>(&DataKey::SuccessionPlan)
+            .get::<AdminKey, SuccessionPlan>(&AdminKey::SuccessionPlan)
         {
             if !existing.activated {
-                return Err(Error::SuccessionPlanExists);
+                return Err(Error::SuccessionError(SuccessionError::Exists));
             }
         }
 
@@ -1596,7 +1632,7 @@ impl EscrowContract {
 
         env.storage()
             .instance()
-            .set(&DataKey::SuccessionPlan, &plan);
+            .set(&AdminKey::SuccessionPlan, &plan);
 
         SuccessorDesignated {
             successor,
@@ -1613,11 +1649,11 @@ impl EscrowContract {
         let mut plan: SuccessionPlan = env
             .storage()
             .instance()
-            .get(&DataKey::SuccessionPlan)
-            .ok_or(Error::SuccessionPlanNotFound)?;
+            .get(&AdminKey::SuccessionPlan)
+            .ok_or(Error::SuccessionError(SuccessionError::NotFound))?;
 
         if plan.activated {
-            return Err(Error::SuccessionAlreadyActivated);
+            return Err(Error::SuccessionError(SuccessionError::AlreadyActivated));
         }
         if plan.successor != successor {
             return Err(Error::Unauthorized);
@@ -1634,7 +1670,7 @@ impl EscrowContract {
             config.total_admins += 1;
             env.storage()
                 .instance()
-                .set(&DataKey::MultiSigConfig, &config);
+                .set(&AdminKey::MultiSigConfig, &config);
             AdminAdded {
                 admin: successor.clone(),
             }
@@ -1644,7 +1680,7 @@ impl EscrowContract {
         plan.activated = true;
         env.storage()
             .instance()
-            .set(&DataKey::SuccessionPlan, &plan);
+            .set(&AdminKey::SuccessionPlan, &plan);
 
         SuccessionActivated {
             new_admin: successor,
@@ -1666,21 +1702,136 @@ impl EscrowContract {
         let plan: SuccessionPlan = env
             .storage()
             .instance()
-            .get(&DataKey::SuccessionPlan)
-            .ok_or(Error::SuccessionPlanNotFound)?;
+            .get(&AdminKey::SuccessionPlan)
+            .ok_or(Error::SuccessionError(SuccessionError::NotFound))?;
 
         if plan.activated {
-            return Err(Error::SuccessionAlreadyActivated);
+            return Err(Error::SuccessionError(SuccessionError::AlreadyActivated));
         }
 
-        env.storage().instance().remove(&DataKey::SuccessionPlan);
+        env.storage().instance().remove(&AdminKey::SuccessionPlan);
         SuccessionRevoked { revoked_by: admin }.publish(&env);
 
         Ok(())
     }
 
     pub fn get_succession_plan(env: Env) -> Option<SuccessionPlan> {
-        env.storage().instance().get(&DataKey::SuccessionPlan)
+        env.storage().instance().get(&AdminKey::SuccessionPlan)
+    }
+
+    pub fn initiate_clawback(
+        env: Env,
+        admin: Address,
+        escrow_id: u64,
+        reason_hash: BytesN<32>,
+        delay_seconds: u64,
+    ) -> Result<u64, Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        if delay_seconds < 86400 {
+            panic!("delay_seconds must be at least 86400");
+        }
+
+        if !env.storage().instance().has(&DataKey::Escrow(escrow_id)) {
+            return Err(Error::EscrowNotFound);
+        }
+
+        if let Some(request_id) = env.storage().instance().get::<AdminKey, u64>(&AdminKey::EscrowClawback(escrow_id)) {
+            if let Some(request) = env.storage().instance().get::<AdminKey, ClawbackRequest>(&AdminKey::ClawbackRequest(request_id)) {
+                if !request.executed && !request.cancelled {
+                    return Err(Error::ClawbackError(ClawbackError::AlreadyInitiated));
+                }
+            }
+        }
+
+        let counter: u64 = env.storage().instance().get(&AdminKey::ClawbackCounter).unwrap_or(0) + 1;
+        env.storage().instance().set(&AdminKey::ClawbackCounter, &counter);
+
+        let now = env.ledger().timestamp();
+        let request = ClawbackRequest {
+            request_id: counter,
+            escrow_id,
+            initiated_by: admin.clone(),
+            reason_hash,
+            execute_after: now + delay_seconds,
+            executed: false,
+            cancelled: false,
+        };
+
+        env.storage().instance().set(&AdminKey::ClawbackRequest(counter), &request);
+        env.storage().instance().set(&AdminKey::EscrowClawback(escrow_id), &counter);
+
+        Ok(counter)
+    }
+
+    pub fn execute_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut request: ClawbackRequest = env.storage().instance().get(&AdminKey::ClawbackRequest(request_id)).ok_or(Error::Unauthorized)?;
+
+        if request.executed {
+            return Err(Error::ClawbackError(ClawbackError::AlreadyExecuted));
+        }
+        if request.cancelled {
+            return Err(Error::ClawbackError(ClawbackError::Cancelled));
+        }
+
+        let now = env.ledger().timestamp();
+        if now < request.execute_after {
+            return Err(Error::ClawbackError(ClawbackError::DelayNotMet));
+        }
+
+        let escrow = EscrowContract::get_escrow(&env, request.escrow_id);
+        let token_client = token::Client::new(&env, &escrow.token);
+        let contract_address = env.current_contract_address();
+
+        token_client.transfer(&contract_address, &admin, &escrow.amount);
+
+        let mut updated_escrow = escrow;
+        updated_escrow.status = EscrowStatus::Resolved;
+        env.storage().instance().set(&DataKey::Escrow(request.escrow_id), &updated_escrow);
+
+        request.executed = true;
+        env.storage().instance().set(&AdminKey::ClawbackRequest(request_id), &request);
+
+        Ok(())
+    }
+
+    pub fn cancel_clawback(env: Env, admin: Address, request_id: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        let mut request: ClawbackRequest = env.storage().instance().get(&AdminKey::ClawbackRequest(request_id)).ok_or(Error::Unauthorized)?;
+
+        if request.executed {
+            return Err(Error::ClawbackError(ClawbackError::AlreadyExecuted));
+        }
+        if request.cancelled {
+            return Err(Error::ClawbackError(ClawbackError::Cancelled));
+        }
+
+        request.cancelled = true;
+        env.storage().instance().set(&AdminKey::ClawbackRequest(request_id), &request);
+
+        Ok(())
+    }
+
+    pub fn get_clawback_request(env: Env, request_id: u64) -> Option<ClawbackRequest> {
+        env.storage().instance().get(&AdminKey::ClawbackRequest(request_id))
     }
 
     pub fn create_escrow(
@@ -2510,7 +2661,7 @@ impl EscrowContract {
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig)
+            .get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig)
         {
             if config.admins.contains(&admin) && early_release {
                 // Admin force release requires time-lock
@@ -3264,7 +3415,7 @@ impl EscrowContract {
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig)
+            .get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig)
         {
             if !config.admins.contains(&admin) {
                 return Err(Error::NotAnAdmin);
@@ -4995,14 +5146,14 @@ impl EscrowContract {
                 let mut config: MultiSigConfig = env
                     .storage()
                     .instance()
-                    .get(&DataKey::MultiSigConfig)
+                    .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if !config.admins.contains(&new_admin) {
                     config.admins.push_back(new_admin.clone());
                     config.total_admins += 1;
                     env.storage()
                         .instance()
-                        .set(&DataKey::MultiSigConfig, &config);
+                        .set(&AdminKey::MultiSigConfig, &config);
                     AdminAdded { admin: new_admin }.publish(env);
                 }
             }
@@ -5011,7 +5162,7 @@ impl EscrowContract {
                 let mut config: MultiSigConfig = env
                     .storage()
                     .instance()
-                    .get(&DataKey::MultiSigConfig)
+                    .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if config.total_admins <= config.required_signatures {
                     return Err(Error::InsufficientAdmins);
@@ -5026,7 +5177,7 @@ impl EscrowContract {
                 config.total_admins -= 1;
                 env.storage()
                     .instance()
-                    .set(&DataKey::MultiSigConfig, &config);
+                    .set(&AdminKey::MultiSigConfig, &config);
                 AdminRemoved {
                     admin: admin_to_remove,
                 }
@@ -5037,7 +5188,7 @@ impl EscrowContract {
                 let mut config: MultiSigConfig = env
                     .storage()
                     .instance()
-                    .get(&DataKey::MultiSigConfig)
+                    .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if required == 0 || required > config.total_admins {
                     return Err(Error::InsufficientAdmins);
@@ -5045,13 +5196,13 @@ impl EscrowContract {
                 config.required_signatures = required;
                 env.storage()
                     .instance()
-                    .set(&DataKey::MultiSigConfig, &config);
+                    .set(&AdminKey::MultiSigConfig, &config);
             }
             ActionType::UpdateThreshold { new_threshold } => {
                 let mut config: MultiSigConfig = env
                     .storage()
                     .instance()
-                    .get(&DataKey::MultiSigConfig)
+                    .get(&AdminKey::MultiSigConfig)
                     .ok_or(Error::MultiSigNotInitialized)?;
                 if new_threshold == 0 {
                     return Err(Error::InvalidThreshold);
@@ -5062,7 +5213,7 @@ impl EscrowContract {
                 config.required_signatures = new_threshold;
                 env.storage()
                     .instance()
-                    .set(&DataKey::MultiSigConfig, &config);
+                    .set(&AdminKey::MultiSigConfig, &config);
             }
             _ => {}
         }
@@ -5305,7 +5456,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
@@ -5377,7 +5528,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
@@ -5432,7 +5583,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
@@ -5507,7 +5658,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .ok_or(Error::MultiSigNotInitialized)?;
         if !config.admins.contains(&admin) {
             return Err(Error::Unauthorized);
@@ -6119,7 +6270,7 @@ impl EscrowContract {
         if let Some(ms) = env
             .storage()
             .instance()
-            .get::<DataKey, MultiSigConfig>(&DataKey::MultiSigConfig)
+            .get::<AdminKey, MultiSigConfig>(&AdminKey::MultiSigConfig)
         {
             if !ms.admins.contains(&admin) {
                 return Err(Error::NotAnAdmin);
@@ -7165,7 +7316,7 @@ impl EscrowContract {
         let config: MultiSigConfig = env
             .storage()
             .instance()
-            .get(&DataKey::MultiSigConfig)
+            .get(&AdminKey::MultiSigConfig)
             .unwrap_or(MultiSigConfig {
                 admins: Vec::new(&env),
                 required_signatures: 1,
