@@ -71,6 +71,9 @@ pub enum DataKey {
     // Migration
     MigrationStatusKey,
     EscrowMigrated(u64),
+    // Issue #78: Escrow templates
+    EscrowTemplate(u64),
+    EscrowTemplateCounter,
     // Escrow health / stale detection
     StaleThresholdConfigKey,
 }
@@ -239,6 +242,8 @@ pub enum Error {
     MigrationNotStarted = 63,
     MigrationAlreadyComplete = 64,
     AlreadyMigrated = 65,
+    TemplateNotFound = 70,
+    TemplateInactive = 71,
     InitiationDeadlinePassed = 69,
     EscrowAlreadyFullyAccepted = 70,
     RollbackAlreadyExecuted = 71,
@@ -1101,6 +1106,41 @@ pub struct MultiPartyDisputeResolved {
     pub escrow_id: u64,
     pub favor_merchant: bool,
     pub resolved_at: u64,
+}
+
+// Issue #78: Escrow template/cloning system
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowTemplate {
+    pub template_id: u64,
+    pub owner: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub release_delay_seconds: u64,
+    pub description: String,
+    pub created_at: u64,
+    pub active: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateCreated {
+    pub template_id: u64,
+    pub owner: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowCreatedFromTemplate {
+    pub escrow_id: u64,
+    pub template_id: u64,
+    pub customer: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemplateDeactivated {
+    pub template_id: u64,
 }
 
 fn sum_approved_weight(participants: &Vec<Participant>) -> u32 {
@@ -6725,6 +6765,138 @@ impl EscrowContract {
         .publish(&env);
 
         Ok(())
+    }
+
+    // ── Issue #78: Escrow template/cloning system ────────────────────────
+
+    pub fn create_escrow_template(
+        env: Env,
+        owner: Address,
+        token: Address,
+        amount: i128,
+        release_delay_seconds: u64,
+        description: String,
+    ) -> Result<u64, Error> {
+        owner.require_auth();
+
+        let counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowTemplateCounter)
+            .unwrap_or(0);
+        let template_id = counter + 1;
+
+        let template = EscrowTemplate {
+            template_id,
+            owner: owner.clone(),
+            token,
+            amount,
+            release_delay_seconds,
+            description,
+            created_at: env.ledger().timestamp(),
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowTemplate(template_id), &template);
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowTemplateCounter, &template_id);
+
+        TemplateCreated {
+            template_id,
+            owner,
+        }
+        .publish(&env);
+
+        Ok(template_id)
+    }
+
+    pub fn create_escrow_from_template(
+        env: Env,
+        customer: Address,
+        template_id: u64,
+    ) -> Result<u64, Error> {
+        customer.require_auth();
+
+        let template: EscrowTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowTemplate(template_id))
+            .ok_or(Error::TemplateNotFound)?;
+
+        if !template.active {
+            return Err(Error::TemplateInactive);
+        }
+
+        let release_timestamp = env.ledger().timestamp() + template.release_delay_seconds;
+
+        let escrow_id = Self::create_escrow(
+            env.clone(),
+            customer.clone(),
+            template.owner.clone(),
+            template.amount,
+            template.token.clone(),
+            release_timestamp,
+            0,
+            0,
+            false,
+        )?;
+
+        EscrowCreatedFromTemplate {
+            escrow_id,
+            template_id,
+            customer,
+        }
+        .publish(&env);
+
+        Ok(escrow_id)
+    }
+
+    pub fn deactivate_template(
+        env: Env,
+        owner: Address,
+        template_id: u64,
+    ) -> Result<(), Error> {
+        owner.require_auth();
+
+        let mut template: EscrowTemplate = env
+            .storage()
+            .instance()
+            .get(&DataKey::EscrowTemplate(template_id))
+            .ok_or(Error::TemplateNotFound)?;
+
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig)
+            .unwrap_or(MultiSigConfig {
+                admins: Vec::new(&env),
+                required_signatures: 1,
+                total_admins: 0,
+                proposal_ttl: 0,
+            });
+
+        if template.owner != owner && !config.admins.contains(&owner) {
+            return Err(Error::Unauthorized);
+        }
+
+        template.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowTemplate(template_id), &template);
+
+        TemplateDeactivated { template_id }.publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_template(env: Env, template_id: u64) -> Result<EscrowTemplate, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EscrowTemplate(template_id))
+            .ok_or(Error::TemplateNotFound)
     }
 
     // ── ANALYTICS HELPERS ─────────────────────────────────────────────────

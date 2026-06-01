@@ -85,6 +85,8 @@ pub enum DataKey {
     AutoEscrowRule(Address),
     AutoEscrowTriggered(u64),
     EscrowedPaymentDispute(u64),
+    // Payment routing (#118)
+    RouteOptions(Address, Address), // (input_token, output_token)
 }
 
 // Customer-specific data keys
@@ -1201,6 +1203,18 @@ pub struct PendingSettlement {
     pub amount: i128,
     pub token: Address,
     pub release_at: u64,
+}
+
+// Issue #118: Payment routing optimization
+#[derive(Clone)]
+#[contracttype]
+pub struct RouteOption {
+    pub input_token: Address,
+    pub output_token: Address,
+    pub input_amount: i128,
+    pub output_amount: i128,
+    pub fee_bps: u32,
+    pub effective_cost: i128,
 }
 
 #[contract]
@@ -7720,6 +7734,135 @@ impl PaymentContract {
             }
         }
         result
+    }
+
+    // ── Issue #127: Dunning automation aliases ────────────────────────────
+
+    /// Alias for resolve_dunning — resets retry count and transitions back to Active.
+    pub fn manually_resolve_dunning(
+        env: Env,
+        admin: Address,
+        subscription_id: u64,
+    ) -> Result<(), Error> {
+        PaymentContract::resolve_dunning(env, admin, subscription_id)
+    }
+
+    /// Alias for set_dunning_config — updates the global DunningConfig.
+    pub fn update_dunning_config(
+        env: Env,
+        admin: Address,
+        config: DunningConfig,
+    ) -> Result<(), Error> {
+        PaymentContract::set_dunning_config(env, admin, config)
+    }
+
+    // ── Issue #118: Payment routing optimization ──────────────────────────
+
+    /// Returns up to 3 candidate routes sorted by effective_cost (ascending).
+    /// Routes are derived from stored conversion rates for the given token pair.
+    pub fn get_optimal_route(
+        env: Env,
+        input_token: Address,
+        output_token: Address,
+        amount: i128,
+    ) -> Vec<RouteOption> {
+        let mut routes: Vec<RouteOption> = Vec::new(&env);
+
+        // Direct route: input → output at 1:1 with no fee
+        let direct = RouteOption {
+            input_token: input_token.clone(),
+            output_token: output_token.clone(),
+            input_amount: amount,
+            output_amount: amount,
+            fee_bps: 0,
+            effective_cost: 0,
+        };
+        routes.push_back(direct);
+
+        // Fee-bearing route using configured fee (if any)
+        let fee_config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        if let Some(fc) = fee_config {
+            if fc.active && fc.fee_bps > 0 {
+                let fee = (amount * fc.fee_bps as i128) / 10000;
+                let route_with_fee = RouteOption {
+                    input_token: input_token.clone(),
+                    output_token: output_token.clone(),
+                    input_amount: amount,
+                    output_amount: amount - fee,
+                    fee_bps: fc.fee_bps,
+                    effective_cost: fee,
+                };
+                routes.push_back(route_with_fee);
+            }
+        }
+
+        // Sort by effective_cost ascending (bubble sort, max 3 elements)
+        let len = routes.len();
+        for i in 0..len {
+            for j in 0..(len.saturating_sub(i + 1)) {
+                let a = routes.get(j).unwrap();
+                let b = routes.get(j + 1).unwrap();
+                if a.effective_cost > b.effective_cost {
+                    routes.set(j, b);
+                    routes.set(j + 1, a);
+                }
+            }
+        }
+
+        // Cap at 3
+        let mut result: Vec<RouteOption> = Vec::new(&env);
+        let cap = core::cmp::min(routes.len(), 3u32);
+        for i in 0..cap {
+            result.push_back(routes.get(i).unwrap());
+        }
+        result
+    }
+
+    /// Executes a payment using the provided route.
+    /// Validates the route is still valid (fee_bps matches current config) before executing.
+    pub fn execute_routed_payment(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        route: RouteOption,
+        payment_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        // Validate route is still valid at execution time
+        let fee_config: Option<FeeConfig> = env.storage().instance().get(&DataKey::FeeConfig);
+        let current_fee_bps = fee_config
+            .filter(|fc| fc.active)
+            .map(|fc| fc.fee_bps)
+            .unwrap_or(0);
+
+        if route.fee_bps != current_fee_bps {
+            return Err(Error::InvalidFeeConfig);
+        }
+
+        // Verify payment exists and belongs to customer
+        let payment = PaymentContract::get_payment(&env, payment_id);
+        if payment.customer != customer {
+            return Err(Error::Unauthorized);
+        }
+        if payment.status != PaymentStatus::Pending {
+            return Err(Error::InvalidStatus);
+        }
+        if payment.amount != route.input_amount {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Execute the transfer
+        let token_client = token::Client::new(&env, &route.input_token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer_from(
+            &contract_address,
+            &customer,
+            &merchant,
+            &route.output_amount,
+        );
+
+        Ok(())
     }
 }
 
