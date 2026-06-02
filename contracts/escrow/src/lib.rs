@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -216,6 +216,54 @@ pub struct EscrowRenewal {
     pub renewal_count: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct VestingAccelerationConfig {
+    pub schedule_id: u64,
+    pub milestone_bps: u32,
+    pub max_acceleration_bps: u32,
+    pub total_accelerated_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowTemplate {
+    pub template_id: u64,
+    pub owner: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub release_delay_seconds: u64,
+    pub description: String,
+    pub created_at: u64,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct StaleThresholdConfig {
+    pub inactivity_seconds: u64,
+    pub near_expiry_buffer_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EscrowHealth {
+    Healthy,
+    NearExpiry,
+    Stale,
+    Disputed,
+    Expired,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowHealthReport {
+    pub escrow_id: u64,
+    pub health: EscrowHealth,
+    pub seconds_until_expiry: Option<i64>,
+    pub last_activity: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum SuccessionCode {
@@ -255,9 +303,8 @@ pub enum Error {
     AlreadyApproved = 25,
     ActionNotReady = 26,
     ContractPaused = 30,
-    ObserverAlreadyAdded = 47,
+     ObserverAlreadyAdded = 47,
     ObserverNotFound = 48,
-    ObserverAccessExpired = 49,
     AccelerationLimitExceeded = 66,
     TenureConfigNotFound = 67,
     TenureBonusAlreadyApplied = 68,
@@ -288,8 +335,6 @@ pub enum Error {
     SwapAlreadyExecuted = 55,
     BatchReleaseSizeLimitExceeded = 76,
     EvidenceDeadlinePassed = 73,
-    AccelerationConfigNotFound = 67,
-    MilestoneAlreadyCompleted = 68,
 }
 
 #[contractevent]
@@ -7520,13 +7565,13 @@ impl EscrowContract {
             match Self::internal_release_escrow(
                 env.clone(),
                 admin.clone(),
-                *id,
+                id,
                 false,
                 request.override_recipient.clone(),
             ) {
-                Ok(_) => succeeded.push_back(*id),
+                Ok(_) => succeeded.push_back(id),
                 Err(e) => {
-                    failed.push_back(*id);
+                    failed.push_back(id);
                     errors.push_back(e as u32);
                 }
             }
@@ -7551,13 +7596,6 @@ impl EscrowContract {
             .instance()
             .get(&EscrowAuxKey::EscrowTemplate(template_id))
             .ok_or(Error::TemplateNotFound)?;
-
-        for id in escrow_ids.iter() {
-            match Self::can_release_escrow(env.clone(), *id, false) {
-                Ok(_) => succeeded.push_back(*id),
-                Err(_) => failed.push_back(*id),
-            }
-        }
 
         template.active = false;
         env.storage()
