@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
-    BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[derive(Clone)]
@@ -102,6 +102,8 @@ pub enum EscrowAuxKey {
     SubAccountCounter(u64),
     // Escrow swap configuration
     EscrowSwapConfig(u64),
+    // Escrow hierarchy configuration
+    EscrowHierarchy(u64),
 }
 
 /// Observer storage keys (separate enum to stay within Soroban symbol limits).
@@ -216,6 +218,63 @@ pub struct EscrowRenewal {
     pub renewal_count: u32,
 }
 
+#[derive(Clone)]
+#[contracttype]
+pub struct VestingAccelerationConfig {
+    pub schedule_id: u64,
+    pub milestone_bps: u32,
+    pub max_acceleration_bps: u32,
+    pub total_accelerated_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowTemplate {
+    pub template_id: u64,
+    pub owner: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub release_delay_seconds: u64,
+    pub description: String,
+    pub created_at: u64,
+    pub active: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct StaleThresholdConfig {
+    pub inactivity_seconds: u64,
+    pub near_expiry_buffer_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub enum EscrowHealth {
+    Healthy,
+    NearExpiry,
+    Stale,
+    Disputed,
+    Expired,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowHealthReport {
+    pub escrow_id: u64,
+    pub health: EscrowHealth,
+    pub seconds_until_expiry: Option<i64>,
+    pub last_activity: u64,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EscrowHierarchyNode {
+    pub escrow_id: u64,
+    pub parent_id: Option<u64>,
+    pub children: Vec<u64>,
+    pub depth: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub enum SuccessionCode {
@@ -255,12 +314,9 @@ pub enum Error {
     AlreadyApproved = 25,
     ActionNotReady = 26,
     ContractPaused = 30,
-    ObserverAlreadyAdded = 47,
+     ObserverAlreadyAdded = 47,
     ObserverNotFound = 48,
-    ObserverAccessExpired = 49,
     AccelerationLimitExceeded = 66,
-    TenureConfigNotFound = 67,
-    TenureBonusAlreadyApplied = 68,
     TransferNotAllowed = 42,
     SameBeneficiary = 43,
     ConditionalEscrowNotFound = 50,
@@ -275,10 +331,6 @@ pub enum Error {
     ExpiryBeforeRelease = 87,
     TemplateNotFound = 88,
     TemplateInactive = 89,
-    InitiationDeadlinePassed = 90,
-    EscrowAlreadyFullyAccepted = 91,
-    RollbackAlreadyExecuted = 92,
-    RollbackNotYetAvailable = 93,
     StaleThresholdNotConfigured = 94,
     SubAccountNotFound = 95,
     SubAccountAlreadyReleased = 96,
@@ -286,10 +338,11 @@ pub enum Error {
     SwapConfigNotFound = 53,
     SwapOutputBelowMinimum = 54,
     SwapAlreadyExecuted = 55,
+    MaxHierarchyDepth = 56,
+    ParentEscrowNotFound = 57,
+    ChildrenNotResolved = 58,
     BatchReleaseSizeLimitExceeded = 76,
     EvidenceDeadlinePassed = 73,
-    AccelerationConfigNotFound = 67,
-    MilestoneAlreadyCompleted = 68,
 }
 
 #[contractevent]
@@ -1918,6 +1971,30 @@ impl EscrowContract {
         auto_refund_on_expiry: bool,
     ) -> Result<u64, Error> {
         customer.require_auth();
+        Self::internal_create_escrow(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            release_timestamp,
+            min_hold_period,
+            expiry_timestamp,
+            auto_refund_on_expiry,
+        )
+    }
+
+    fn internal_create_escrow(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        release_timestamp: u64,
+        min_hold_period: u64,
+        expiry_timestamp: u64,
+        auto_refund_on_expiry: bool,
+    ) -> Result<u64, Error> {
 
         // Block new escrow creation during migration
         if let Some(status) = env
@@ -2576,6 +2653,11 @@ impl EscrowContract {
         }
 
         let escrow = EscrowContract::get_escrow(&env, escrow_id);
+
+        // Guard: block release if any child escrows are unresolved
+        if !Self::can_parent_release(env.clone(), escrow_id) {
+            return Err(Error::ChildrenNotResolved);
+        }
 
         // Guard: block full release if any sub-accounts remain unreleased
         let sub_count: u64 = env
@@ -4286,11 +4368,11 @@ impl EscrowContract {
         escrow_id: u64,
         participant: Address,
     ) -> Result<(), Error> {
-        let config = Self::get_tenure_config(env.clone()).ok_or(Error::TenureConfigNotFound)?;
+        let config = Self::get_tenure_config(env.clone()).ok_or(Error::EscrowNotFound)?;
 
         let marker = DataKey::TenureBonusApplied(escrow_id, participant.clone());
         if env.storage().instance().has(&marker) {
-            return Err(Error::TenureBonusAlreadyApplied);
+            return Err(Error::AlreadyProcessed);
         }
         env.storage().instance().set(&marker, &true);
 
@@ -7520,13 +7602,13 @@ impl EscrowContract {
             match Self::internal_release_escrow(
                 env.clone(),
                 admin.clone(),
-                *id,
+                id,
                 false,
                 request.override_recipient.clone(),
             ) {
-                Ok(_) => succeeded.push_back(*id),
+                Ok(_) => succeeded.push_back(id),
                 Err(e) => {
-                    failed.push_back(*id);
+                    failed.push_back(id);
                     errors.push_back(e as u32);
                 }
             }
@@ -7551,13 +7633,6 @@ impl EscrowContract {
             .instance()
             .get(&EscrowAuxKey::EscrowTemplate(template_id))
             .ok_or(Error::TemplateNotFound)?;
-
-        for id in escrow_ids.iter() {
-            match Self::can_release_escrow(env.clone(), *id, false) {
-                Ok(_) => succeeded.push_back(*id),
-                Err(_) => failed.push_back(*id),
-            }
-        }
 
         template.active = false;
         env.storage()
@@ -7982,6 +8057,148 @@ impl EscrowContract {
             .instance()
             .get(&EscrowAuxKey::EscrowSwapConfig(escrow_id))
     }
+
+    pub fn create_child_escrow(
+        env: Env,
+        admin: Address,
+        parent_id: u64,
+        amount: i128,
+        token: Address,
+        customer: Address,
+        merchant: Address,
+    ) -> Result<u64, Error> {
+        admin.require_auth();
+        let config = Self::get_multisig_config(env.clone());
+        if !config.admins.contains(&admin) {
+            return Err(Error::NotAnAdmin);
+        }
+
+        // Verify parent escrow exists
+        if !env.storage().instance().has(&DataKey::Escrow(parent_id)) {
+            return Err(Error::ParentEscrowNotFound);
+        }
+
+        // Get or initialize parent hierarchy node to find parent's depth
+        let mut parent_node = env
+            .storage()
+            .instance()
+            .get::<EscrowAuxKey, EscrowHierarchyNode>(&EscrowAuxKey::EscrowHierarchy(parent_id))
+            .unwrap_or(EscrowHierarchyNode {
+                escrow_id: parent_id,
+                parent_id: None,
+                children: Vec::new(&env),
+                depth: 0, // Root depth is 0
+            });
+
+        if parent_node.depth + 1 > 3 {
+            return Err(Error::MaxHierarchyDepth);
+        }
+
+        let child_depth = parent_node.depth + 1;
+
+        let parent_escrow = Self::get_escrow(&env, parent_id);
+        let child_id = Self::internal_create_escrow(
+            env.clone(),
+            customer,
+            merchant,
+            amount,
+            token,
+            parent_escrow.release_timestamp,
+            parent_escrow.min_hold_period,
+            parent_escrow.expiry_timestamp,
+            parent_escrow.auto_refund_on_expiry,
+        )?;
+
+        // Update parent children list
+        parent_node.children.push_back(child_id);
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::EscrowHierarchy(parent_id), &parent_node);
+
+        // Store child hierarchy node
+        let child_node = EscrowHierarchyNode {
+            escrow_id: child_id,
+            parent_id: Some(parent_id),
+            children: Vec::new(&env),
+            depth: child_depth,
+        };
+        env.storage()
+            .instance()
+            .set(&EscrowAuxKey::EscrowHierarchy(child_id), &child_node);
+
+        Ok(child_id)
+    }
+
+    pub fn get_escrow_hierarchy(env: Env, root_id: u64) -> Vec<EscrowHierarchyNode> {
+        let mut result = Vec::new(&env);
+        if !env.storage().instance().has(&DataKey::Escrow(root_id)) {
+            return result;
+        }
+
+        let mut queue = Vec::new(&env);
+        queue.push_back(root_id);
+
+        let mut index = 0;
+        while index < queue.len() {
+            let current_id = queue.get(index).unwrap();
+            index += 1;
+
+            let node = env
+                .storage()
+                .instance()
+                .get::<EscrowAuxKey, EscrowHierarchyNode>(&EscrowAuxKey::EscrowHierarchy(current_id))
+                .unwrap_or(EscrowHierarchyNode {
+                    escrow_id: current_id,
+                    parent_id: None,
+                    children: Vec::new(&env),
+                    depth: 0,
+                });
+
+            result.push_back(node.clone());
+
+            for child_id in node.children.iter() {
+                queue.push_back(child_id);
+            }
+        }
+        result
+    }
+
+    pub fn can_parent_release(env: Env, parent_id: u64) -> bool {
+        if !env.storage().instance().has(&DataKey::Escrow(parent_id)) {
+            return false;
+        }
+
+        let mut queue = Vec::new(&env);
+        queue.push_back(parent_id);
+
+        let mut index = 0;
+        while index < queue.len() {
+            let current_id = queue.get(index).unwrap();
+            index += 1;
+
+            if let Some(node) = env.storage().instance().get::<EscrowAuxKey, EscrowHierarchyNode>(&EscrowAuxKey::EscrowHierarchy(current_id)) {
+                for child_id in node.children.iter() {
+                    // Check if child is resolved
+                    if !Self::is_escrow_resolved(&env, child_id) {
+                        return false;
+                    }
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        true
+    }
+
+    fn is_escrow_resolved(env: &Env, escrow_id: u64) -> bool {
+        if let Some(escrow) = env.storage().instance().get::<DataKey, Escrow>(&DataKey::Escrow(escrow_id)) {
+            match escrow.status {
+                EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => true,
+                _ => false,
+            }
+        } else {
+            true
+        }
+    }
 }
 
 impl EscrowAnalytics {
@@ -8001,6 +8218,9 @@ impl EscrowAnalytics {
 
 #[cfg(test)]
 mod swap_test;
+
+#[cfg(test)]
+mod hierarchy_test;
 
 // mod test;
 
