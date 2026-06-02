@@ -98,6 +98,8 @@ pub enum DataKey {
     // Payment memo with hash verification
     PaymentMemo(u64),
     PaymentMemoVersion(u64),
+    // Payment forwarding (#220)
+    PaymentForwardConfig(Address),
 }
 
 // Customer-specific data keys
@@ -369,6 +371,10 @@ pub enum Error {
     PayoutScheduleNotFound = 89,
     PayoutNotYetDue = 90,
     NothingToSettle = 91,
+    // Payment forwarding (#220)
+    ForwardConfigNotFound = 109,
+    ForwardLoop = 110,
+    InvalidForwardBps = 111,
 }
 
 #[contractevent]
@@ -551,6 +557,15 @@ pub struct PaymentSplitConfig {
     pub payment_id: u64,
     pub recipients: Vec<SplitRecipient>,
     pub executed: bool,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct PaymentForwardConfig {
+    pub merchant: Address,
+    pub forward_to: Address,
+    pub forward_bps: u32,
+    pub active: bool,
 }
 
 #[contractevent]
@@ -1236,6 +1251,29 @@ pub struct PaymentMemoVerified {
     pub memo_hash: BytesN<32>,
     pub verified_at: u64,
     pub verified_by: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentForwardConfigSet {
+    pub merchant: Address,
+    pub forward_to: Address,
+    pub forward_bps: u32,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentForwardConfigRemoved {
+    pub merchant: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaymentForwarded {
+    pub payment_id: u64,
+    pub merchant: Address,
+    pub forward_to: Address,
+    pub forward_amount: i128,
 }
 
 #[derive(Clone)]
@@ -2903,6 +2941,32 @@ impl PaymentContract {
             &net_amount,
         );
 
+        // Check if merchant has an active payment forward config
+        if let Ok(forward_config) = PaymentContract::get_forward_config(env, payment.merchant.clone())
+        {
+            if forward_config.active {
+                // Calculate the forward amount based on forward_bps
+                let forward_amount = (net_amount * (forward_config.forward_bps as i128)) / 10000;
+                
+                // Transfer the forward amount from merchant to forward_to address
+                if forward_amount > 0 {
+                    token_client.transfer(
+                        &payment.merchant,
+                        &forward_config.forward_to,
+                        &forward_amount,
+                    );
+
+                    (PaymentForwarded {
+                        payment_id,
+                        merchant: payment.merchant.clone(),
+                        forward_to: forward_config.forward_to,
+                        forward_amount,
+                    })
+                    .publish(env);
+                }
+            }
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::Payment(payment_id), &payment);
@@ -2971,6 +3035,87 @@ impl PaymentContract {
         PaymentContract::update_platform_daily_bucket(env, now, 0, 0, 0);
 
         Ok(())
+    }
+
+    pub fn set_payment_forward(
+        env: Env,
+        merchant: Address,
+        forward_to: Address,
+        forward_bps: u32,
+    ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_payment_forward")?;
+        merchant.require_auth();
+
+        // Validate forward_bps: must be between 1 and 10000
+        if forward_bps < 1 || forward_bps > 10000 {
+            return Err(Error::InvalidForwardBps);
+        }
+
+        // Check for forward loops: if forward_to already has a forward config, reject it
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::PaymentForwardConfig(forward_to.clone()))
+        {
+            return Err(Error::ForwardLoop);
+        }
+
+        // Create and store the forward config
+        let config = PaymentForwardConfig {
+            merchant: merchant.clone(),
+            forward_to: forward_to.clone(),
+            forward_bps,
+            active: true,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentForwardConfig(merchant.clone()), &config);
+
+        (PaymentForwardConfigSet {
+            merchant: merchant.clone(),
+            forward_to,
+            forward_bps,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn remove_payment_forward(env: Env, merchant: Address) -> Result<(), Error> {
+        Self::require_not_paused(&env, "remove_payment_forward")?;
+        merchant.require_auth();
+
+        // Check if the forward config exists
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::PaymentForwardConfig(merchant.clone()))
+        {
+            return Err(Error::ForwardConfigNotFound);
+        }
+
+        // Remove the forward config
+        env.storage()
+            .instance()
+            .remove(&DataKey::PaymentForwardConfig(merchant.clone()));
+
+        (PaymentForwardConfigRemoved {
+            merchant: merchant.clone(),
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_forward_config(
+        env: Env,
+        merchant: Address,
+    ) -> Result<PaymentForwardConfig, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PaymentForwardConfig(merchant))
+            .ok_or(Error::ForwardConfigNotFound)
     }
 
     pub fn configure_loyalty(env: Env, admin: Address, config: LoyaltyConfig) -> Result<(), Error> {
@@ -8957,3 +9102,6 @@ mod test_finality_delay;
 
 #[cfg(test)]
 mod test_fee_rebate;
+
+#[cfg(test)]
+mod test_payment_forward;
