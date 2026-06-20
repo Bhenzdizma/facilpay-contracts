@@ -343,6 +343,7 @@ pub enum Error {
     ChildrenNotResolved = 58,
     BatchReleaseSizeLimitExceeded = 76,
     EvidenceDeadlinePassed = 73,
+    BatchTooLarge = 77,
 }
 
 #[contractevent]
@@ -3264,7 +3265,7 @@ impl EscrowContract {
 
         const MAX_BATCH: u32 = 10;
         if evidence_items.len() > MAX_BATCH {
-            return Err(Error::InvalidStatus);
+            return Err(Error::BatchTooLarge);
         }
 
         let now = env.ledger().timestamp();
@@ -8325,8 +8326,8 @@ mod hierarchy_test;
 // #[cfg(test)]
 // mod escalation_timeout_test;
 //
-// #[cfg(test)]
-// mod bulk_evidence_test;
+#[cfg(test)]
+mod bulk_evidence_test;
 // mod migration_test;
 //
 // #[cfg(test)]
