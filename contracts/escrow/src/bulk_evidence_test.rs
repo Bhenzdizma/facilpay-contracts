@@ -88,6 +88,99 @@ fn test_pagination_two_pages() {
     assert_eq!(client.get_evidence_page(&escrow_id, &1u32).len(), 1u32);
 }
 
+/// Exactly 10 items sits on the boundary — must be accepted, not rejected.
+#[test]
+fn test_exact_max_batch_accepted() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    let mut items: Vec<Bytes> = Vec::new(&env);
+    for i in 0..10u32 {
+        items.push_back(Bytes::from_array(&env, &[i as u8; 32]));
+    }
+
+    let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
+    assert!(result.is_ok(), "10-item batch should be accepted");
+
+    let page = client.get_evidence_page(&escrow_id, &0u32);
+    assert_eq!(page.len(), 10u32);
+}
+
+/// An empty batch (0 items) should succeed and create an empty page rather than
+/// panic or error out.
+#[test]
+fn test_empty_batch_creates_empty_page() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    let items: Vec<Bytes> = Vec::new(&env);
+    let page_count = client.submit_evidence_batch(&customer, &escrow_id, &items);
+
+    assert_eq!(page_count, 1u32);
+    assert_eq!(client.get_evidence_page(&escrow_id, &0u32).len(), 0u32);
+}
+
+/// Calling submit_evidence_batch on a non-disputed escrow must return
+/// `Error::NotDisputed`, regardless of batch size.
+#[test]
+fn test_batch_on_non_disputed_escrow_rejected() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+
+    // Create escrow but do NOT dispute it — status stays Locked.
+    let escrow_id = client.create_escrow(
+        &customer, &merchant, &500i128, &token,
+        &9999u64, &0u64, &0u64, &false,
+    );
+
+    let mut items: Vec<Bytes> = Vec::new(&env);
+    items.push_back(Bytes::from_array(&env, &[1u8; 32]));
+
+    let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
+    assert_eq!(result, Err(Ok(Error::NotDisputed)));
+}
+
+/// A third party that is neither the customer nor the merchant must be rejected
+/// with `Error::Unauthorized`.
+#[test]
+fn test_unauthorized_caller_rejected() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    let stranger = Address::generate(&env);
+
+    let mut items: Vec<Bytes> = Vec::new(&env);
+    items.push_back(Bytes::from_array(&env, &[9u8; 32]));
+
+    let result = client.try_submit_evidence_batch(&stranger, &escrow_id, &items);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// A rejected oversized batch must leave no partial state: the page count for
+/// the escrow must remain 0 after the failed call.
+#[test]
+fn test_oversized_batch_leaves_no_partial_state() {
+    let env = Env::default();
+    let (client, _admin, customer, merchant, token) = setup(&env);
+    let escrow_id = make_disputed_escrow(&env, &client, &customer, &merchant, &token);
+
+    let mut items: Vec<Bytes> = Vec::new(&env);
+    for _ in 0..15u32 {
+        items.push_back(Bytes::from_array(&env, &[0u8; 32]));
+    }
+
+    // Must fail.
+    let result = client.try_submit_evidence_batch(&customer, &escrow_id, &items);
+    assert_eq!(result, Err(Ok(Error::BatchTooLarge)));
+
+    // No page should have been written — the page is empty.
+    let page = client.get_evidence_page(&escrow_id, &0u32);
+    assert_eq!(page.len(), 0u32, "no partial state should be stored on failure");
+}
+
 #[test]
 fn test_backward_compat_get_evidence_still_works() {
     let env = Env::default();
