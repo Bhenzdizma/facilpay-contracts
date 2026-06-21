@@ -609,7 +609,7 @@ pub struct PaymentChannel {
     pub token: Address,
     pub deposited: i128,
     pub settled: i128,
-    pub nonce: u64,
+    pub settled_nonce: u64,
     pub open: bool,
     pub expires_at: u64,
     pub customer_pk: BytesN<32>,
@@ -8275,7 +8275,7 @@ impl PaymentContract {
             token,
             deposited: amount,
             settled: 0,
-            nonce: 0,
+            settled_nonce: 0,
             open: true,
             expires_at,
             customer_pk,
@@ -8320,7 +8320,8 @@ impl PaymentContract {
             return Err(Error::ChannelExpired);
         }
 
-        if nonce <= channel.nonce {
+        // Enforce strictly increasing nonce to prevent stale off-chain state replay
+        if nonce <= channel.settled_nonce {
             return Err(Error::InvalidNonce);
         }
 
@@ -8349,7 +8350,7 @@ impl PaymentContract {
         }
 
         channel.settled = merchant_amount;
-        channel.nonce = nonce;
+        channel.settled_nonce = nonce;
         channel.open = false;
 
         env.storage()
