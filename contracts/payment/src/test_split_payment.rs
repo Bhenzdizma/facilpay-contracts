@@ -84,7 +84,7 @@ fn test_invalid_split_shares() {
     }); // total = 9000, not 10000
 
     let result = client.try_create_split_payment(&customer, &merchant, &1000, &token, &recipients);
-    assert_eq!(result, Err(Ok(Error::InvalidSplitShares)));
+    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::InvalidSplitShares))));
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn test_too_many_recipients() {
     }
 
     let result = client.try_create_split_payment(&customer, &merchant, &1000, &token, &recipients);
-    assert_eq!(result, Err(Ok(Error::TooManyRecipients)));
+    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::TooManyRecipients))));
 }
 
 #[test]
@@ -132,5 +132,5 @@ fn test_double_execution_rejected() {
     client.execute_split_settlement(&admin, &payment_id);
 
     let result = client.try_execute_split_settlement(&admin, &payment_id);
-    assert_eq!(result, Err(Ok(Error::SplitAlreadyExecuted)));
+    assert_eq!(result, Err(Ok(Error::Feature(FeatureError::SplitAlreadyExecuted))));
 }

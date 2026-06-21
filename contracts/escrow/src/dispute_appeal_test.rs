@@ -3,6 +3,7 @@
 mod dispute_appeal_tests {
     use crate::*;
     use soroban_sdk::{testutils::*, Address, Env};
+use crate::*;
 
     #[test]
     fn test_file_timely_appeal() {
@@ -246,7 +247,7 @@ mod dispute_appeal_tests {
         );
 
         assert!(appeal_result.is_err());
-        assert_eq!(appeal_result.unwrap_err(), Error::Unauthorized);
+        assert_eq!(appeal_result.unwrap_err(), Error::Basic(BasicError::Unauthorized));
     }
 
     #[test]

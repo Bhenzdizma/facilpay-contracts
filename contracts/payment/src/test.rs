@@ -131,7 +131,7 @@ fn test_batch_accumulation_and_premature_trigger() {
 
     // Attempt to trigger payout prematurely
     let res = client.try_trigger_scheduled_payout(&merchant);
-    assert_eq!(res.unwrap_err().unwrap(), Error::PayoutNotYetDue);
+    assert_eq!(res.unwrap_err().unwrap(), Error::Payment(PaymentError::PayoutNotYetDue));
 }
 
 #[test]
@@ -242,7 +242,7 @@ fn test_flag_address_blocks_payments() {
         &0,
         &meta,
     );
-    assert_eq!(result.unwrap_err().unwrap(), Error::AddressFlagged);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::AddressFlagged));
 }
 
 #[test]
@@ -321,7 +321,7 @@ fn test_unflag_requires_current_flag() {
     let customer = Address::generate(&env);
 
     let result = client.try_unflag_address(&admin, &customer);
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::InvalidStatus));
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn test_flag_address_fails_if_already_flagged() {
     client.flag_address(&admin, &customer, &String::from_str(&env, "first reason"));
     let result =
         client.try_flag_address(&admin, &customer, &String::from_str(&env, "second reason"));
-    assert_eq!(result.unwrap_err().unwrap(), Error::AddressAlreadyFlagged);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::AddressAlreadyFlagged));
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn test_rate_limit_breach_event_emitted() {
 
     // Failed invocations may rollback emitted events in host simulation.
     // The key behavior is that the payment attempt is rejected.
-    assert_eq!(result.unwrap_err().unwrap(), Error::RateLimitExceeded);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::RateLimitExceeded));
 }
 
 #[test]
@@ -846,7 +846,7 @@ fn test_redeem_points_fails_when_points_are_expired() {
 
     env.ledger().set_timestamp(1101);
     let result = client.try_redeem_points(&customer, &10, &payment_id);
-    assert_eq!(result.unwrap_err().unwrap(), Error::PointsExpired);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Feature(FeatureError::PointsExpired));
 }
 
 #[test]
@@ -1275,7 +1275,7 @@ fn test_cancel_nonexistent_payment() {
     // Try to cancel a non-existent payment
     let result = client.try_cancel_payment(&caller, &999);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::PaymentNotFound);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::NotFound));
 }
 
 #[test]
@@ -1305,7 +1305,7 @@ fn test_cancel_payment_unauthorized() {
     // Try to cancel as unauthorized user
     let result = client.try_cancel_payment(&unauthorized_user, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::Unauthorized));
 }
 
 #[test]
@@ -1381,7 +1381,7 @@ fn test_cancel_refunded_payment() {
     // Try to cancel refunded payment
     let result = client.try_cancel_payment(&customer, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::InvalidStatus));
 }
 
 #[test]
@@ -1413,7 +1413,7 @@ fn test_cancel_already_cancelled_payment() {
     // Try to cancel again
     let result = client.try_cancel_payment(&customer, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidStatus);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::InvalidStatus));
 }
 
 #[test]
@@ -2811,7 +2811,7 @@ fn test_create_payment_metadata_too_large() {
         &large_metadata,
     );
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::MetadataTooLarge);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::MetadataTooLarge));
 }
 
 #[test]
@@ -2938,7 +2938,7 @@ fn test_update_payment_notes_unauthorized() {
     let notes = String::from_str(&env, "Unauthorized note");
     let result = client.try_update_payment_notes(&unauthorized, &payment_id, &notes);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::Unauthorized));
 }
 
 #[test]
@@ -2968,7 +2968,7 @@ fn test_update_payment_notes_customer_cannot_update() {
     let notes = String::from_str(&env, "Customer trying to add notes");
     let result = client.try_update_payment_notes(&customer, &payment_id, &notes);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::Unauthorized));
 }
 
 #[test]
@@ -2984,7 +2984,7 @@ fn test_update_payment_notes_payment_not_found() {
 
     let result = client.try_update_payment_notes(&merchant, &999, &notes);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::PaymentNotFound);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::NotFound));
 }
 
 #[test]
@@ -3015,7 +3015,7 @@ fn test_update_payment_notes_too_large() {
     let large_notes = String::from_str(&env, &"x".repeat(1025));
     let result = client.try_update_payment_notes(&merchant, &payment_id, &large_notes);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::NotesTooLarge);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::NotesTooLarge));
 }
 
 #[test]
@@ -3345,7 +3345,7 @@ fn test_set_conversion_rate_unauthorized() {
 
     let result = client.try_set_conversion_rate(&unauthorized, &Currency::BTC, &50000_0000000);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::Unauthorized);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::Unauthorized));
 }
 
 #[test]
@@ -3528,7 +3528,7 @@ fn test_partial_refund_exceeds_payment() {
 
     let result = client.try_partial_refund(&admin, &payment_id, &1500);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::RefundExceedsPayment));
 }
 
 #[test]
@@ -3560,7 +3560,7 @@ fn test_partial_refund_cumulative_exceeds_payment() {
     client.partial_refund(&admin, &payment_id, &700);
     let result = client.try_partial_refund(&admin, &payment_id, &400);
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::RefundExceedsPayment);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Payment(PaymentError::RefundExceedsPayment));
 }
 
 #[test]
@@ -3631,7 +3631,7 @@ fn test_merchant_rate_limit_enforcement() {
     assert!(result.is_err());
     assert_eq!(
         result.unwrap_err().unwrap(),
-        Error::MerchantRateLimitExceeded
+        Error::Payment(PaymentError::MerchantRateLimitExceeded)
     );
 }
 
@@ -3714,7 +3714,7 @@ fn test_merchant_rate_limit_global_fallback() {
         &meta,
     );
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::AmountExceedsLimit);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::AmountExceedsLimit));
 }
 
 #[test]
@@ -3841,7 +3841,7 @@ fn test_dunning_retry_too_early_returns_error() {
     // Calling before next_retry_at must return RetryTooEarly
     env.ledger().set_timestamp(next_retry - 1);
     let result = client.try_execute_recurring_payment(&sub_id);
-    assert_eq!(result, Err(Ok(Error::RetryTooEarly)));
+    assert_eq!(result, Err(Ok(Error::Subscription(SubscriptionError::RetryTooEarly))));
 }
 
 #[test]
@@ -3918,7 +3918,7 @@ fn test_dunning_max_retries_suspends_subscription() {
     assert_eq!(sub.status, SubscriptionStatus::Suspended);
 
     let last = client.try_execute_recurring_payment(&sub_id);
-    assert_eq!(last, Err(Ok(Error::SubscriptionNotActive)));
+    assert_eq!(last, Err(Ok(Error::Subscription(SubscriptionError::NotActive))));
 }
 
 #[test]
@@ -4224,7 +4224,7 @@ fn test_dispute_escrowed_payment_rejects_unauthorized_caller() {
         &ids.0,
         &String::from_str(&env, "unauthorized"),
     );
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -4272,10 +4272,10 @@ fn test_disputed_escrowed_payment_cannot_be_completed_or_cancelled() {
     );
 
     let complete_result = payment_client.try_complete_escrowed_payment(&admin, &ids.0);
-    assert_eq!(complete_result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(complete_result, Err(Ok(Error::Payment(PaymentError::InvalidStatus))));
 
     let cancel_result = payment_client.try_cancel_escrowed_payment(&customer, &ids.0);
-    assert_eq!(cancel_result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(cancel_result, Err(Ok(Error::Payment(PaymentError::InvalidStatus))));
 }
 
 #[test]
@@ -5416,7 +5416,7 @@ fn test_set_tier_thresholds_validates_ascending_order() {
         ],
     );
     assert!(result.is_err());
-    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidTierThresholds);
+    assert_eq!(result.unwrap_err().unwrap(), Error::Basic(BasicError::InvalidTierThresholds));
 }
 
 #[test]
@@ -6043,7 +6043,7 @@ fn test_evaluate_condition_oracle_price_fails() {
     // Oracle conditions should fail with OracleCallFailed error
     let result = client.try_evaluate_condition(&payment_id);
     assert!(result.is_err());
-    assert_eq!(result.err(), Some(Ok(Error::OracleCallFailed)));
+    assert_eq!(result.err(), Some(Ok(Error::Basic(BasicError::OracleCallFailed))));
 }
 
 #[test]
@@ -6072,7 +6072,7 @@ fn test_evaluate_condition_cross_contract_state_false() {
 
     // Cross-contract invoke failures should return a typed error.
     let result = client.try_evaluate_condition(&payment_id);
-    assert_eq!(result.err(), Some(Ok(Error::ConditionEvaluationFailed)));
+    assert_eq!(result.err(), Some(Ok(Error::Feature(FeatureError::ConditionEvaluationFailed))));
 }
 
 #[test]
@@ -6138,7 +6138,7 @@ fn test_complete_conditional_payment_condition_not_met() {
     // Attempt to complete should fail with ConditionNotMet
     let result = client.try_complete_conditional_payment(&admin, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.err(), Some(Ok(Error::ConditionNotMet)));
+    assert_eq!(result.err(), Some(Ok(Error::Feature(FeatureError::ConditionNotMet))));
 
     // Verify payment is still pending
     let payment = client.get_payment(&payment_id);
@@ -6174,7 +6174,7 @@ fn test_complete_conditional_payment_expired() {
     // Attempt to complete should fail with PaymentExpired
     let result = client.try_complete_conditional_payment(&admin, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.err(), Some(Ok(Error::PaymentExpired)));
+    assert_eq!(result.err(), Some(Ok(Error::Payment(PaymentError::Expired))));
 }
 
 #[test]
@@ -6204,7 +6204,7 @@ fn test_complete_conditional_payment_unauthorized() {
     // Attempt to complete with unauthorized user should fail
     let result = client.try_complete_conditional_payment(&unauthorized_user, &payment_id);
     assert!(result.is_err());
-    assert_eq!(result.err(), Some(Ok(Error::Unauthorized)));
+    assert_eq!(result.err(), Some(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -6215,7 +6215,7 @@ fn test_get_conditional_payment_not_found() {
     // Attempt to get non-existent conditional payment should fail
     let result = client.try_get_conditional_payment(&999);
     assert!(result.is_err());
-    assert_eq!(result.err(), Some(Ok(Error::PaymentNotFound)));
+    assert_eq!(result.err(), Some(Ok(Error::Payment(PaymentError::NotFound))));
 }
 
 #[test]
@@ -6660,7 +6660,7 @@ fn test_large_payment_auto_routes_through_multisig() {
     // Note: in Soroban, state changes in a failed invocation are rolled back,
     // so the proposal must be created separately via propose_large_payment.
     let result = client.try_complete_payment(&admin, &payment_id);
-    assert_eq!(result, Err(Ok(Error::PaymentRequiresMultiSig)));
+    assert_eq!(result, Err(Ok(Error::Proposal(ProposalError::RequiresMultiSig))));
 
     // Create proposal explicitly — only the payment's merchant can propose
     client.propose_large_payment(&merchant, &payment_id);

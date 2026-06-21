@@ -60,7 +60,7 @@ fn test_report_usage_unauthorized() {
     );
 
     let result = client.try_report_usage(&stranger, &sub_id, &5u64);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]

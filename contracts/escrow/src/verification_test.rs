@@ -158,7 +158,7 @@ fn test_get_escrow_status_resolved() {
 fn test_get_escrow_status_nonexistent_returns_error() {
     let (_env, client) = setup();
     let result = client.try_get_escrow_status(&9999_u64);
-    assert_eq!(result, Err(Ok(Error::EscrowNotFound)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::NotFound))));
 }
 
 // ── get_escrow_parties ────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ fn test_get_escrow_parties_returns_correct_addresses() {
 fn test_get_escrow_parties_nonexistent_returns_error() {
     let (_env, client) = setup();
     let result = client.try_get_escrow_parties(&9999_u64);
-    assert_eq!(result, Err(Ok(Error::EscrowNotFound)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::NotFound))));
 }
 
 // ── get_escrow_amount ─────────────────────────────────────────────────────────
@@ -206,7 +206,7 @@ fn test_get_escrow_amount_returns_correct_value() {
 fn test_get_escrow_amount_nonexistent_returns_error() {
     let (_env, client) = setup();
     let result = client.try_get_escrow_amount(&9999_u64);
-    assert_eq!(result, Err(Ok(Error::EscrowNotFound)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::NotFound))));
 }
 
 // ── verify_escrow_participant ─────────────────────────────────────────────────
