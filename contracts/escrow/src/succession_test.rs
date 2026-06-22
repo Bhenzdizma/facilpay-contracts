@@ -63,7 +63,7 @@ fn test_activate_succession_rejects_premature_activation() {
 
     env.ledger().set_timestamp(5_119);
     let result = client.try_activate_succession(&successor);
-    assert_eq!(result, Err(Ok(Error::ActionNotReady)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::NotReady))));
 }
 
 #[test]

@@ -2,6 +2,7 @@
 mod batch_release_tests {
     use crate::*;
     use soroban_sdk::{testutils::Address as _, Address, Env, Vec};
+use crate::*;
 
     fn setup_test(env: &Env) -> (EscrowContractClient, Address) {
         env.mock_all_auths();
@@ -61,8 +62,8 @@ mod batch_release_tests {
         assert_eq!(result.succeeded[0], 1);
         assert_eq!(result.failed[0], 2);
         // Escrow 2 was created with release_timestamp=10000 (future), so
-        // internal_release_escrow returns Error::ReleaseNotYetAvailable.
-        assert_eq!(result.errors[0], Error::ReleaseNotYetAvailable as u32);
+        // internal_release_escrow returns Error::Escrow(EscrowError::ReleaseNotYetAvailable).
+        assert_eq!(result.errors[0], Error::Escrow(EscrowError::ReleaseNotYetAvailable).to_u32());
     }
 
     #[test]
@@ -81,7 +82,7 @@ mod batch_release_tests {
         };
 
         let result = client.try_batch_release_escrows(&admin, &request);
-        assert_eq!(result, Err(Ok(Error::BatchReleaseSizeLimitExceeded)));
+        assert_eq!(result, Err(Ok(Error::Action(ActionError::BatchReleaseSizeLimitExceeded))));
     }
 
     #[test]
@@ -119,7 +120,7 @@ mod batch_release_tests {
         };
 
         let result = client.try_batch_release_escrows(&non_admin, &request);
-        assert_eq!(result, Err(Ok(Error::NotAnAdmin)));
+        assert_eq!(result, Err(Ok(Error::Basic(BasicError::NotAnAdmin))));
     }
 
     #[test]

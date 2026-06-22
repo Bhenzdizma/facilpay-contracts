@@ -2,6 +2,7 @@
 mod timelock_tests {
     use crate::*;
     use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
+use crate::*;
 
     fn setup_test(env: &Env) -> (EscrowContractClient, Address) {
         env.mock_all_auths();
@@ -59,7 +60,7 @@ mod timelock_tests {
 
         // Try to execute immediately - should fail
         let result = client.try_execute_queued_action(&action_id);
-        assert_eq!(result, Err(Ok(Error::ActionNotReady)));
+        assert_eq!(result, Err(Ok(Error::Action(ActionError::NotReady))));
     }
 
     #[test]
@@ -117,7 +118,7 @@ mod timelock_tests {
         };
 
         let result = client.try_set_timelock_config(&admin, &config);
-        assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+        assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
         // Test delay too long (more than 7 days)
         let config = TimeLockConfig {
             delay: 700000, // > 7 days
@@ -125,6 +126,6 @@ mod timelock_tests {
         };
 
         let result = client.try_set_timelock_config(&admin, &config);
-        assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+        assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
     }
 }

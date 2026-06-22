@@ -28,7 +28,7 @@ fn test_two_level_hierarchy_success() {
 
     // Verify parent release is blocked since child is unresolved (Locked)
     let release_res = client.try_release_escrow(&admin, &parent_id, &false);
-    assert_eq!(release_res, Err(Ok(Error::ChildrenNotResolved)));
+    assert_eq!(release_res, Err(Ok(Error::Escrow(EscrowError::ChildrenNotResolved))));
 
     // Advance ledger timestamp so child can be released without early release check
     env.ledger().set_timestamp(2000);
@@ -76,7 +76,7 @@ fn test_depth_limit_enforced() {
     // Creating under level 3 (would be level 4) should fail with MaxHierarchyDepth
     let lvl4_res =
         client.try_create_child_escrow(&admin, &lvl3_id, &50_i128, &token, &customer, &merchant);
-    assert_eq!(lvl4_res, Err(Ok(Error::MaxHierarchyDepth)));
+    assert_eq!(lvl4_res, Err(Ok(Error::Escrow(EscrowError::MaxHierarchyDepth))));
 }
 
 #[test]
@@ -151,10 +151,10 @@ fn test_create_child_escrow_validation() {
         &customer,
         &merchant,
     );
-    assert_eq!(res, Err(Ok(Error::NotAnAdmin)));
+    assert_eq!(res, Err(Ok(Error::Basic(BasicError::NotAnAdmin))));
 
     // Non-existent parent fails with ParentEscrowNotFound
     let res2 =
         client.try_create_child_escrow(&admin, &999_u64, &100_i128, &token, &customer, &merchant);
-    assert_eq!(res2, Err(Ok(Error::ParentEscrowNotFound)));
+    assert_eq!(res2, Err(Ok(Error::Escrow(EscrowError::ParentEscrowNotFound))));
 }

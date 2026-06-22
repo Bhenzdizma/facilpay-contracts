@@ -80,7 +80,7 @@ fn test_non_participant_cannot_dispute() {
     let escrow_id = make_3_party_escrow(&env, &client, &token, &p1, &p2, &p3);
 
     let result = client.try_dispute_multi_party_escrow(&outsider, &escrow_id);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn test_duplicate_vote_rejected() {
     client.vote_on_multi_party_dispute(&p1, &escrow_id, &false);
 
     let result = client.try_vote_on_multi_party_dispute(&p1, &escrow_id, &false);
-    assert_eq!(result, Err(Ok(Error::DuplicateApproval)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::DuplicateApproval))));
 }
 
 #[test]
@@ -157,5 +157,5 @@ fn test_no_quorum_before_deadline_blocked() {
     client.vote_on_multi_party_dispute(&p1, &escrow_id, &false);
 
     let result = client.try_resolve_multi_party_dispute(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::ApprovalsThresholdNotMet)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet))));
 }

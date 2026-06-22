@@ -135,7 +135,7 @@ fn test_escrow_swap_below_minimum_fails() {
 
     // Executing should fail with SwapOutputBelowMinimum
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::SwapOutputBelowMinimum)));
+    assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapOutputBelowMinimum))));
 }
 
 #[test]
@@ -169,7 +169,7 @@ fn test_escrow_swap_double_execution_fails() {
 
     // Execute second time: fails with SwapAlreadyExecuted
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::SwapAlreadyExecuted)));
+    assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapAlreadyExecuted))));
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn test_escrow_swap_unauthorized_config_fails() {
         &1400_i128,
         &oracle,
     );
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn test_escrow_swap_unauthorized_execute_fails() {
 
     // Non-merchant, non-admin tries to execute swap: fails with Unauthorized
     let res = client.try_execute_escrow_swap(&unauthorized_caller, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
+    assert_eq!(res, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -252,5 +252,5 @@ fn test_escrow_swap_config_not_found_fails() {
 
     // Execute swap directly without configuring first: fails with SwapConfigNotFound
     let res = client.try_execute_escrow_swap(&merchant, &escrow_id);
-    assert_eq!(res, Err(Ok(Error::SwapConfigNotFound)));
+    assert_eq!(res, Err(Ok(Error::Action(ActionError::SwapConfigNotFound))));
 }

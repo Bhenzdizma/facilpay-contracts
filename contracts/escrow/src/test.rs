@@ -942,7 +942,7 @@ fn test_commit_root_recommit_guard() {
     client.commit_evidence_root(&customer, &escrow_id, &root);
 
     let result = client.try_commit_evidence_root(&merchant, &escrow_id, &root);
-    assert_eq!(result, Err(Ok(Error::RootAlreadyCommitted)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::RootAlreadyCommitted))));
 }
 
 #[test]
@@ -1036,7 +1036,7 @@ fn test_submit_evidence_with_invalid_merkle_proof_rejected() {
         &bad_proof,
         &0_u32,
     );
-    assert_eq!(result, Err(Ok(Error::InvalidMerkleProof)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::InvalidMerkleProof))));
 
     // Invalid proof should not store evidence
     let count = client.get_evidence_count(&escrow_id);
@@ -1533,7 +1533,7 @@ fn test_create_vesting_escrow_rejects_milestone_unlock_before_cliff() {
         &4000_u64,
         &milestones,
     );
-    assert_eq!(result, Err(Ok(Error::InvalidVestingSchedule)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidVestingSchedule))));
 }
 
 #[test]
@@ -2012,7 +2012,7 @@ fn test_release_vested_amount_before_cliff_returns_cliff_error() {
 
     env.ledger().set_timestamp(1500);
     let result = client.try_release_vested_amount(&admin, &escrow_id);
-    assert_eq!(result, Err(Ok(Error::CliffPeriodNotPassed)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::CliffPeriodNotPassed))));
 }
 
 #[test]
@@ -2503,7 +2503,7 @@ fn test_weighted_threshold_unmet_holds() {
 
     env.ledger().set_timestamp(1001);
     let result = client.try_release_multi_party_escrow(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::ApprovalsThresholdNotMet)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::ApprovalsThresholdNotMet))));
 
     let escrow = client.get_multi_party_escrow(&escrow_id);
     assert_eq!(escrow.status, EscrowStatus::Locked);
@@ -3112,7 +3112,7 @@ fn test_release_multi_token_escrow_before_timestamp() {
 
     // Before release_timestamp, release should fail.
     let result = client.try_release_multi_token_escrow(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::ReleaseNotYetAvailable)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::ReleaseNotYetAvailable))));
 }
 
 #[test]
@@ -3184,7 +3184,7 @@ fn test_timelock_execute_after_delay_succeeds() {
     client.release_multi_token_escrow(&escrow_id);
 
     let result = client.try_release_multi_token_escrow(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
 }
 
 #[test]
@@ -3196,7 +3196,7 @@ fn test_get_multi_token_escrow_not_found() {
 
     let result = client.try_get_multi_token_escrow(&999_u64);
     match result {
-        Err(Ok(Error::EscrowNotFound)) => {}
+        Err(Ok(Error::Escrow(EscrowError::NotFound))) => {}
         _ => panic!("expected EscrowNotFound"),
     }
 
@@ -4422,7 +4422,7 @@ fn test_mark_milestone_complete_enforces_cumulative_cap() {
         .unwrap();
 
     let result = client.try_mark_milestone_complete(&admin, &escrow_id);
-    assert_eq!(result, Err(Ok(Error::AccelerationLimitExceeded)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::AccelerationLimitExceeded))));
 }
 
 #[test]
@@ -4459,7 +4459,7 @@ fn test_mark_milestone_complete_duplicate_milestone_fails() {
         .unwrap();
 
     let result = client.try_mark_milestone_complete(&admin, &escrow_id);
-    assert_eq!(result, Err(Ok(Error::MilestoneAlreadyReleased)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::MilestoneAlreadyReleased))));
 }
 
 #[test]
@@ -4822,11 +4822,11 @@ fn test_batch_escrow_creation_partial_failure() {
     assert_eq!(results.get(0).unwrap().error_code, 0);
     assert_eq!(
         results.get(1).unwrap().error_code,
-        Error::InvalidStatus as u32
+        Error::Escrow(EscrowError::InvalidStatus).to_u32()
     );
     assert_eq!(
         results.get(2).unwrap().error_code,
-        Error::ReleaseNotYetAvailable as u32
+        Error::Escrow(EscrowError::ReleaseNotYetAvailable).to_u32()
     );
 }
 
@@ -4873,7 +4873,7 @@ fn test_batch_escrow_creation_too_large() {
     assert!(!results.get(0).unwrap().success);
     assert_eq!(
         results.get(0).unwrap().error_code,
-        Error::BatchTooLarge as u32
+        Error::BatchTooLarge.to_u32()
     );
 }
 
@@ -4934,7 +4934,7 @@ fn test_batch_escrow_creation_unauthorized() {
 
     assert_eq!(results.len(), 1);
     assert!(!results.get(0).unwrap().success);
-    assert_eq!(results.get(0).unwrap().error_code, Error::NotAnAdmin as u32);
+    assert_eq!(results.get(0).unwrap().error_code, Error::Basic(BasicError::NotAnAdmin).to_u32());
 }
 
 // ── DISPUTE RECOMMENDATION TESTS ────────────────────────────────────────
@@ -5218,5 +5218,5 @@ fn test_conditional_escrow_re_evaluation_rejected() {
     state_client.set_state(&state_key, &Bytes::from_slice(&env, b"delivered"));
 
     let result = client.try_evaluate_and_release(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::ConditionAlreadyEvaluated)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::ConditionAlreadyEvaluated))));
 }
