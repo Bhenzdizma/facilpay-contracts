@@ -45,6 +45,31 @@ fn test_zero_trial_default_behavior() {
     assert!(!sub.trial_data.converted);
 }
 
+// interval = 0 must be rejected, otherwise proration in resume_subscription
+// would divide by zero.
+#[test]
+fn test_create_subscription_rejects_zero_interval() {
+    let env = Env::default();
+    let (client, _) = setup(&env);
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    let result = client.try_create_subscription(
+        &customer,
+        &merchant,
+        &1000i128,
+        &token,
+        &Currency::USDC,
+        &0u64, // interval
+        &0u64, // duration
+        &3u64,
+        &String::from_str(&env, ""),
+        &0u64,
+    );
+    assert_eq!(result.unwrap_err().unwrap(), Error::InvalidInterval);
+}
+
 // During trial: execute_recurring_payment returns Ok without charging
 #[test]
 fn test_execute_during_trial_skips_charge() {

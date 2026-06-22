@@ -451,6 +451,7 @@ pub enum Error {
     InvalidForwardBps = 111,
     // Arithmetic safety
     BillingOverflow = 124,
+    InvalidInterval = 125,
 }
 
 // Manual trait implementations replacing #[contracterror] (105 variants exceed the 50-variant XDR spec limit)
@@ -472,7 +473,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
     fn try_from(error: soroban_sdk::Error) -> Result<Self, soroban_sdk::Error> {
         if error.is_type(soroban_sdk::xdr::ScErrorType::Contract) {
             let code = error.get_code();
-            if matches!(code, 1..=21 | 23..=48 | 50..=56 | 58..=80 | 85..=91 | 95..=96 | 100..=102 | 106..=111 | 114..=124)
+            if matches!(code, 1..=21 | 23..=48 | 50..=56 | 58..=80 | 85..=91 | 95..=96 | 100..=102 | 106..=111 | 114..=125)
             {
                 // SAFETY: Error is #[repr(u32)] and all valid discriminants are covered by the matches! guard above
                 Ok(unsafe { core::mem::transmute::<u32, Error>(code) })
@@ -4174,6 +4175,9 @@ impl PaymentContract {
         }
         if metadata.len() > MAX_METADATA_SIZE {
             return Err(Error::Basic(BasicError::MetadataTooLarge));
+        }
+        if interval == 0 {
+            return Err(Error::InvalidInterval);
         }
 
         let counter: u64 = env
