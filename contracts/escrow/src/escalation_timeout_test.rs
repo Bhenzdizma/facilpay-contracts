@@ -2,6 +2,7 @@
 
 use crate::*;
 use soroban_sdk::{testutils::{Address as _, Ledger}, token, Address, Env};
+use crate::*;
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
     env.mock_all_auths();
@@ -44,7 +45,7 @@ fn test_trigger_timeout_fails_if_not_escalated() {
     env.ledger().set_timestamp(100_000);
     // Never called escalate_dispute, so escalated_at is None → InvalidStatus
     let result = client.try_trigger_timeout_resolution(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
 }
 
 #[test]
@@ -61,7 +62,7 @@ fn test_trigger_timeout_fails_before_deadline() {
     // Only 100s elapsed, timeout=300
     env.ledger().set_timestamp(1600);
     let result = client.try_trigger_timeout_resolution(&escrow_id);
-    assert_eq!(result, Err(Ok(Error::TimeoutNotReached)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::TimeoutNotReached))));
 }
 
 #[test]

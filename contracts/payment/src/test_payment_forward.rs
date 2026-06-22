@@ -1,6 +1,6 @@
 #![cfg(test)]
 mod tests {
-    use crate::{
+    use crate::{FeatureError,
         Currency, Error, FeeConfig, PaymentContract, PaymentContractClient, PaymentStatus,
     };
     use soroban_sdk::{testutils::Address as AddressTestUtils, token, Address, Env, String};
@@ -89,7 +89,7 @@ mod tests {
         let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
         let result = client.try_set_payment_forward(&merchant, &forward_to, &0);
-        assert_eq!(result, Err(Ok(Error::InvalidForwardBps)));
+        assert_eq!(result, Err(Ok(Error::Feature(FeatureError::InvalidForwardBps))));
     }
 
     #[test]
@@ -97,7 +97,7 @@ mod tests {
         let (_env, client, _admin, _customer, merchant, forward_to, _token) = setup_env();
 
         let result = client.try_set_payment_forward(&merchant, &forward_to, &10001);
-        assert_eq!(result, Err(Ok(Error::InvalidForwardBps)));
+        assert_eq!(result, Err(Ok(Error::Feature(FeatureError::InvalidForwardBps))));
     }
 
     #[test]
@@ -111,7 +111,7 @@ mod tests {
 
         // merchant (A) → forward_to (B) → C → merchant (A) is a cycle
         let result = client.try_set_payment_forward(&merchant, &forward_to, &5000);
-        assert_eq!(result, Err(Ok(Error::ForwardLoop)));
+        assert_eq!(result, Err(Ok(Error::Feature(FeatureError::ForwardLoop))));
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod tests {
         let (_env, client, _admin, _customer, merchant, _forward_to, _token) = setup_env();
 
         let result = client.try_remove_payment_forward(&merchant);
-        assert_eq!(result, Err(Ok(Error::ForwardConfigNotFound)));
+        assert_eq!(result, Err(Ok(Error::Feature(FeatureError::ForwardConfigNotFound))));
     }
 
     #[test]

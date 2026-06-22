@@ -2,6 +2,7 @@
 
 use crate::*;
 use soroban_sdk::testutils::Ledger;
+use crate::*;
 use soroban_sdk::{testutils::Address as _, Address, Env};
 
 fn setup(
@@ -95,7 +96,7 @@ fn test_duplicate_active_observer_rejected() {
     client.add_observer(&customer, &escrow_id, &observer, &3600_u64);
 
     let result = client.try_add_observer(&customer, &escrow_id, &observer, &3600_u64);
-    assert_eq!(result, Err(Ok(Error::ObserverAlreadyAdded)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::ObserverAlreadyAdded))));
 }
 
 #[test]
@@ -107,7 +108,7 @@ fn test_unauthorized_grant_rejected() {
 
     let escrow_id = create_escrow(&client, &customer, &merchant, &token);
     let result = client.try_add_observer(&stranger, &escrow_id, &observer, &3600_u64);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -129,5 +130,5 @@ fn test_remove_observer_not_found() {
 
     let escrow_id = create_escrow(&client, &customer, &merchant, &token);
     let result = client.try_remove_observer(&customer, &escrow_id, &observer);
-    assert_eq!(result, Err(Ok(Error::ObserverNotFound)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::ObserverNotFound))));
 }

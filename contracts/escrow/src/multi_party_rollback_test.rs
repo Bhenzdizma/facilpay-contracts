@@ -2,6 +2,7 @@
 
 use crate::*;
 use soroban_sdk::testutils::Ledger;
+use crate::*;
 use soroban_sdk::{testutils::Address as _, token, Address, Env, Vec};
 
 // Returns (client, admin, customer, merchant, token).
@@ -168,7 +169,7 @@ fn test_non_participant_cannot_accept() {
 
     let stranger = Address::generate(&env);
     let result = client.try_accept_multi_party_escrow(&stranger, &id);
-    assert_eq!(result, Err(Ok(Error::ParticipantNotFound)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::ParticipantNotFound))));
 }
 
 #[test]
@@ -182,7 +183,7 @@ fn test_duplicate_acceptance_fails() {
 
     client.accept_multi_party_escrow(&customer, &id);
     let result = client.try_accept_multi_party_escrow(&customer, &id);
-    assert_eq!(result, Err(Ok(Error::AlreadyApproved)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::AlreadyApproved))));
 }
 
 #[test]

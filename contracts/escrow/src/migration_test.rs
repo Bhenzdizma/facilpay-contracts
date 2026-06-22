@@ -2,6 +2,7 @@
 
 use crate::*;
 use soroban_sdk::testutils::Ledger;
+use crate::*;
 use soroban_sdk::{testutils::Address as _, vec, Address, Env};
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
@@ -108,7 +109,7 @@ fn test_create_escrow_blocked_during_migration() {
     let result = client.try_create_escrow(
         &customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false,
     );
-    assert_eq!(result, Err(Ok(Error::ContractPaused)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::ContractPaused))));
 }
 
 #[test]
@@ -139,7 +140,7 @@ fn test_double_migrate_returns_already_migrated() {
     client.migrate_escrow(&admin, &id);
 
     let result = client.try_migrate_escrow(&admin, &id);
-    assert_eq!(result, Err(Ok(Error::AlreadyMigrated)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::AlreadyMigrated))));
 }
 
 #[test]
@@ -193,7 +194,7 @@ fn test_migrate_without_begin_fails() {
     let id = client.create_escrow(&customer, &merchant, &500_i128, &token, &1000_u64, &0_u64, &0_u64, &false);
 
     let result = client.try_migrate_escrow(&admin, &id);
-    assert_eq!(result, Err(Ok(Error::MigrationNotStarted)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::MigrationNotStarted))));
 }
 
 // ── UNAUTHORIZED ADMIN ────────────────────────────────────────────────────────
@@ -206,5 +207,5 @@ fn test_begin_migration_unauthorized() {
 
     let not_admin = Address::generate(&env);
     let result = client.try_begin_migration(&not_admin);
-    assert_eq!(result, Err(Ok(Error::NotAnAdmin)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::NotAnAdmin))));
 }

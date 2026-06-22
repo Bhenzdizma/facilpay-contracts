@@ -90,7 +90,7 @@ fn test_double_release_rejected() {
     client.release_sub_account(&admin, &escrow_id, &sub_id);
 
     let result = client.try_release_sub_account(&admin, &escrow_id, &sub_id);
-    assert_eq!(result, Err(Ok(Error::SubAccountAlreadyReleased)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::SubAccountAlreadyReleased))));
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn test_funding_exceeds_escrow_rejected() {
 
     // Try to allocate more than the escrow holds
     let result = client.try_create_sub_account(&merchant, &escrow_id, &label(&env), &1001);
-    assert_eq!(result, Err(Ok(Error::SubAccountFundingExceedsEscrow)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::SubAccountFundingExceedsEscrow))));
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn test_parent_guard_blocks_release_with_unreleased_sub_accounts() {
 
     // Parent release should fail because sub-account is not yet released
     let result = client.try_release_escrow(&admin, &escrow_id, &true);
-    assert_eq!(result, Err(Ok(Error::InvalidStatus)));
+    assert_eq!(result, Err(Ok(Error::Escrow(EscrowError::InvalidStatus))));
 }
 
 #[test]

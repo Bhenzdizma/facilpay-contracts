@@ -2,6 +2,7 @@
 
 use crate::*;
 use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
+use crate::*;
 
 fn setup() -> (Env, EscrowContractClient<'static>, Address) {
     let env = Env::default();
@@ -18,7 +19,7 @@ fn test_direct_update_required_signatures_rejected() {
     let (env, client, admin) = setup();
     let _ = env;
     let result = client.try_update_required_signatures(&admin, &1u32);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]

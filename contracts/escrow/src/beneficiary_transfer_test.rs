@@ -57,7 +57,7 @@ fn test_unauthorized_transfer_rejected() {
     let new_merchant = Address::generate(&env);
 
     let result = client.try_transfer_escrow_beneficiary(&customer, &1u64, &new_merchant);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert_eq!(result, Err(Ok(Error::Basic(BasicError::Unauthorized))));
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn test_transfer_blocked_on_disputed_escrow() {
     client.dispute_escrow(&customer, &1u64);
 
     let result = client.try_transfer_escrow_beneficiary(&merchant, &1u64, &new_merchant);
-    assert_eq!(result, Err(Ok(Error::TransferNotAllowed)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::TransferNotAllowed))));
 }
 
 #[test]
@@ -80,7 +80,7 @@ fn test_transfer_blocked_on_resolved_escrow() {
     client.resolve_dispute(&admin, &1u64, &false);
 
     let result = client.try_transfer_escrow_beneficiary(&merchant, &1u64, &new_merchant);
-    assert_eq!(result, Err(Ok(Error::TransferNotAllowed)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::TransferNotAllowed))));
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn test_same_beneficiary_rejected() {
     let (_env, client, _admin, _customer, merchant, _token) = setup();
 
     let result = client.try_transfer_escrow_beneficiary(&merchant, &1u64, &merchant);
-    assert_eq!(result, Err(Ok(Error::SameBeneficiary)));
+    assert_eq!(result, Err(Ok(Error::Action(ActionError::SameBeneficiary))));
 }
 
 #[test]
