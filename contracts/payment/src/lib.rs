@@ -92,7 +92,7 @@ pub enum SubscriptionError {
     Ended = 304, DunningNotFound = 305, NotInDunning = 306, RetryNotDue = 307,
     GracePeriodExpired = 308, RetryTooEarly = 309, MeteredNotFound = 310,
     BillingCapExceeded = 311, GroupNotFound = 312, AlreadyInGroup = 313,
-    GroupSizeLimitExceeded = 314,
+    GroupSizeLimitExceeded = 314, TrialExpired = 315, MaxTrialDurationExceeded = 316,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,7 +160,7 @@ impl TryFrom<soroban_sdk::Error> for Error {
             let code = error.get_code();
             if code >= 500 && code <= 537 { return Ok(Error::Feature(unsafe { core::mem::transmute(code) })); }
             if code >= 400 && code <= 406 { return Ok(Error::Proposal(unsafe { core::mem::transmute(code) })); }
-            if code >= 300 && code <= 314 { return Ok(Error::Subscription(unsafe { core::mem::transmute(code) })); }
+            if code >= 300 && code <= 316 { return Ok(Error::Subscription(unsafe { core::mem::transmute(code) })); }
             if code >= 200 && code <= 222 { return Ok(Error::Payment(unsafe { core::mem::transmute(code) })); }
             if code >= 100 && code <= 125 { return Ok(Error::Basic(unsafe { core::mem::transmute(code) })); }
         }
@@ -1646,6 +1646,7 @@ const MAX_METADATA_SIZE: u32 = 512;
 const MAX_NOTES_SIZE: u32 = 1024;
 const DEFAULT_MAX_RETRIES: u64 = 3;
 const SECONDS_PER_DAY: u64 = 86400;
+const MAX_TRIAL_DURATION: u64 = 90 * SECONDS_PER_DAY; // 90 days max trial
 
 // Fee tier volume thresholds (raw token units)
 const PREMIUM_VOLUME_THRESHOLD: i128 = 10_000;
@@ -4296,6 +4297,59 @@ impl PaymentContract {
         }
 
         Ok(sub_id)
+    }
+
+    /// Extend the trial period for a subscription. Only callable by the merchant before the trial expires.
+    /// The total trial duration cannot exceed `MAX_TRIAL_DURATION`.
+    pub fn extend_trial(
+        env: Env,
+        merchant: Address,
+        subscription_id: u64,
+        additional_seconds: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        let mut sub: Subscription = env
+            .storage()
+            .instance()
+            .get(&DataKey::Subscription(SubscriptionKey::Data(subscription_id)))
+            .ok_or(Error::Subscription(SubscriptionError::NotFound))?;
+
+        if sub.merchant != merchant {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if sub.trial_data.ends_at == 0 {
+            return Err(Error::Subscription(SubscriptionError::NotFound));
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= sub.trial_data.ends_at {
+            return Err(Error::Subscription(SubscriptionError::TrialExpired));
+        }
+
+        let new_total = sub
+            .trial_data
+            .period_seconds
+            .checked_add(additional_seconds)
+            .ok_or(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded))?;
+
+        if new_total > MAX_TRIAL_DURATION {
+            return Err(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded));
+        }
+
+        sub.trial_data.ends_at = sub
+            .trial_data
+            .ends_at
+            .checked_add(additional_seconds)
+            .ok_or(Error::Subscription(SubscriptionError::MaxTrialDurationExceeded))?;
+        sub.trial_data.period_seconds = new_total;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Subscription(SubscriptionKey::Data(subscription_id)), &sub);
+
+        Ok(())
     }
 
     /// Execute the next recurring payment for a subscription.
