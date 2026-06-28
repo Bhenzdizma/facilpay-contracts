@@ -105,10 +105,9 @@ pub enum DisputeKey {
 #[derive(Clone)]
 #[contracttype]
 pub enum DataKey {
-    Config(ConfigKey),
-    Escrow(EscrowKey),
-    Participant(ParticipantKey),
-    Dispute(DisputeKey),
+    Config(ConfigKey), Escrow(EscrowKey), Participant(ParticipantKey), Dispute(DisputeKey),
+    VoteWeight(u64, Address),
+    ReleaseThresholdBps(u64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1484,11 +1483,16 @@ pub struct MultiPartyDisputeResolved {
     pub resolved_at: u64,
 }
 
-fn sum_approved_weight(participants: &Vec<Participant>) -> u32 {
+fn sum_approved_weight(env: &Env, escrow_id: u64, participants: &Vec<Participant>) -> u32 {
     let mut total: u32 = 0;
     for p in participants.iter() {
         if p.approved {
-            total += p.weight_bps;
+            let weight: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::VoteWeight(escrow_id, p.address.clone()))
+                .unwrap_or(p.weight_bps);
+            total += weight;
         }
     }
     total
@@ -2421,6 +2425,15 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::MultiPartyCounter), &escrow_id);
 
+        for p in escrow.participants.iter() {
+            env.storage()
+                .instance()
+                .set(&DataKey::VoteWeight(escrow_id, p.address.clone()), &p.share_bps);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReleaseThresholdBps(escrow_id), &10000u32);
+
         MultiPartyEscrowCreated {
             escrow_id,
             participant_count: escrow.participants.len(),
@@ -2457,7 +2470,12 @@ impl EscrowContract {
         let mut found_voter = false;
         for p in escrow.participants.iter() {
             if p.address == caller {
-                if p.weight_bps == 0 {
+                let weight = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::VoteWeight(escrow_id, caller.clone()))
+                    .unwrap_or(p.weight_bps);
+                if weight == 0 {
                     return Err(Error::Basic(BasicError::Unauthorized));
                 }
                 if p.approved {
@@ -2468,7 +2486,7 @@ impl EscrowContract {
                     address: p.address.clone(),
                     role: p.role.clone(),
                     share_bps: p.share_bps,
-                    weight_bps: p.weight_bps,
+                    weight_bps: weight,
                     approved: true,
                     approved_at: Some(now),
                 });
@@ -2516,8 +2534,13 @@ impl EscrowContract {
         }
 
         // Check if cumulative approved weight meets the threshold
-        let approved_weight = sum_approved_weight(&escrow.participants);
-        if approved_weight < escrow.threshold_bps {
+        let approved_weight = sum_approved_weight(&env, escrow_id, &escrow.participants);
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReleaseThresholdBps(escrow_id))
+            .unwrap_or(escrow.threshold_bps);
+        if approved_weight < threshold {
             return Err(Error::Action(ActionError::ApprovalsThresholdNotMet));
         }
 
@@ -2571,8 +2594,13 @@ impl EscrowContract {
             .instance()
             .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
             .ok_or(Error::Escrow(EscrowError::NotFound))?;
-        let approved = sum_approved_weight(&escrow.participants);
-        Ok((approved, escrow.threshold_bps))
+        let approved = sum_approved_weight(&env, escrow_id, &escrow.participants);
+        let threshold = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReleaseThresholdBps(escrow_id))
+            .unwrap_or(escrow.threshold_bps);
+        Ok((approved, threshold))
     }
 
     /// Admin updates a participant's voting weight. Blocked once any participant has approved.
@@ -2640,6 +2668,10 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
 
+        env.storage()
+            .instance()
+            .set(&DataKey::VoteWeight(escrow_id, participant.clone()), &weight_bps);
+
         WeightUpdated {
             escrow_id,
             participant,
@@ -2681,6 +2713,10 @@ impl EscrowContract {
         env.storage()
             .instance()
             .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ReleaseThresholdBps(escrow_id), &threshold_bps);
 
         ThresholdUpdated {
             escrow_id,
@@ -4331,6 +4367,28 @@ impl EscrowContract {
             .get::<DataKey, Escrow>(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
             .map(|e| e.customer == address || e.merchant == address)
             .unwrap_or(false)
+    }
+
+    /// Returns the full escrow details. Access is restricted to the escrow
+    /// customer, merchant, or an active observer (granted via `add_observer`).
+    pub fn get_escrow_details(env: Env, caller: Address, escrow_id: u64) -> Result<Escrow, Error> {
+        caller.require_auth();
+
+        let escrow: Escrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if caller == escrow.customer || caller == escrow.merchant {
+            return Ok(escrow);
+        }
+
+        if EscrowContract::verify_observer_access(env.clone(), escrow_id, caller) {
+            return Ok(escrow);
+        }
+
+        Err(Error::Basic(BasicError::Unauthorized))
     }
 
     /// Grants a time-limited observer role for an escrow. Only the escrow
@@ -8807,6 +8865,9 @@ mod swap_test;
 #[cfg(test)]
 mod hierarchy_test;
 
+#[cfg(test)]
+mod multi_party_weight_test;
+
 // mod test;
 
 // #[cfg(test)]
@@ -8846,8 +8907,8 @@ mod bulk_evidence_test;
 // #[cfg(test)]
 // mod multi_party_rollback_test;
 //
-// #[cfg(test)]
-// mod observer_test;
+#[cfg(test)]
+mod observer_test;
 //
 // mod health_check_test;
 //
